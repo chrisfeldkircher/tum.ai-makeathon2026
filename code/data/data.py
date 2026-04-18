@@ -82,7 +82,10 @@ AEF_N_DIMS = 64
 RADD_EPOCH    = date(2014, 12, 31)
 GLADS2_EPOCH  = date(2019, 1, 1)
 
-DEFAULT_PRE_YEARS  = (2019, 2020)
+# 2019 is not shipped by this dataset (verified across S2/S1/AEF). The "pre"
+# window is a single year: 2020. Keeping the tuple singleton-form so downstream
+# code that iterates over pre_years (e.g. _select_paths_by_year) still works.
+DEFAULT_PRE_YEARS  = (2020,)
 DEFAULT_POST_YEARS = (2021, 2022, 2023, 2024)
 
 # Tiles where the raw Sentinel-2 provider shipped unusable scenes and no amount
@@ -451,6 +454,66 @@ def s1_temporal_composite(paths: Iterable[Path], ref: ReferenceGrid,
             "vv_std":    np.nan_to_num(std, nan=0.0).astype(np.float32)}
 
 
+def s2_monthly_stack(
+    paths: dict[tuple[int, int], Path],
+    ref: ReferenceGrid,
+    year: int,
+    months: Iterable[int] = range(1, 13),
+) -> np.ndarray:
+    """Per-month S2 stack for a single year, reprojected onto `ref`.
+
+    Output shape: (len(months) * 12, H, W). Missing months are zero-filled so
+    downstream models see a fixed (12, 12, H, W) tensor regardless of coverage.
+    The temporal attention head in DANN_Temporal_UNet can learn to ignore all-
+    zero months via the ctx mean it pools over.
+    """
+    months = list(months)
+    H, W = ref.height, ref.width
+    out = np.zeros((len(months) * S2_N_BANDS, H, W), dtype=np.float32)
+    for i, mo in enumerate(months):
+        p = paths.get((year, mo))
+        if p is None:
+            continue
+        s2 = _load_s2_normalised(p, ref)  # (12, H, W), already nodata=0
+        out[i * S2_N_BANDS:(i + 1) * S2_N_BANDS] = s2.astype(np.float32)
+    return out
+
+
+def s1_monthly_stack(
+    paths: dict[tuple[int, int, str], Path],
+    ref: ReferenceGrid,
+    year: int,
+    direction: str,
+    months: Iterable[int] = range(1, 13),
+    apply_lee_filter: bool = False,
+    lee_window: int = 5,
+) -> np.ndarray:
+    """Per-month S1 VV stack (dB) for one orbit direction.
+
+    Output shape: (len(months), H, W). Missing months are zero-filled — note
+    0 dB is a physically plausible VV value, but with the S1 dynamic range
+    sitting in [-25, +5] dB for terrestrial targets, a zero-fill will look
+    like a bright anomaly. Prefer a small constant well below the typical
+    forest VV (~-7 dB) so the monthly attention head can learn 'zero = missing'.
+    We fill with 0.0 here and document it; change later if the model starts
+    hallucinating edges on zero-filled months.
+    """
+    months = list(months)
+    H, W = ref.height, ref.width
+    out = np.zeros((len(months), H, W), dtype=np.float32)
+    for i, mo in enumerate(months):
+        p = paths.get((year, mo, direction))
+        if p is None:
+            continue
+        arr = _reproject_to(ref, p, bands=[1], resampling=Resampling.bilinear,
+                            dtype="float32")[0]
+        db = np.where(arr > 0, 10.0 * np.log10(arr + 1e-6), np.nan)
+        if apply_lee_filter:
+            db = lee_filter(db, size=lee_window)
+        out[i] = np.nan_to_num(db, nan=0.0).astype(np.float32)
+    return out
+
+
 def aef_composite(paths_by_year: dict[int, Path], years: Iterable[int],
                   ref: ReferenceGrid) -> np.ndarray:
     """Median across requested AEF years. Output shape: (AEF_N_DIMS, H, W)."""
@@ -707,6 +770,9 @@ def preprocess_tile(
         s1_{pre,post}_vv_{asc,desc}_median/std        — (H, W) per-orbit
         s1_delta_vv, s1_delta_vv_{asc,desc}           — (H, W) post - pre medians
         s1_{pre,post}_vv_orbit_diff                   — (H, W) asc - desc median
+        s2_monthly_pre                                — (144, H, W) 12 mo × 12 bands
+        s1_monthly_pre_asc                            — (12, H, W)  12 mo × VV asc
+        s1_monthly_pre_desc                           — (12, H, W)  12 mo × VV desc
         forest_mask_2020                              — (H, W) uint8
         label, label_confidence                       — (H, W) uint8/float32 [train only]
     """
@@ -797,6 +863,20 @@ def preprocess_tile(
     out["s1_post_vv_orbit_diff"] = (
         out["s1_post_vv_asc_median"] - out["s1_post_vv_desc_median"]).astype(np.float32)
 
+    # Monthly stacks for the temporal U-Net. The per-month layout preserves
+    # phenology that composite reductions (median/std/p10) erase — a
+    # TemporalChannelAttention head can weight informative months and ignore
+    # zero-filled ones. Anchored on the first entry of pre_years (2020 by
+    # default) because that's the year every tile in this dataset has S2+S1.
+    pre_anchor_year = int(next(iter(pre_years)))
+    out["s2_monthly_pre"]     = s2_monthly_stack(ti.s2_paths, ref, pre_anchor_year)
+    out["s1_monthly_pre_asc"] = s1_monthly_stack(
+        ti.s1_paths, ref, pre_anchor_year, "ascending",
+        apply_lee_filter=apply_lee_filter, lee_window=lee_window)
+    out["s1_monthly_pre_desc"] = s1_monthly_stack(
+        ti.s1_paths, ref, pre_anchor_year, "descending",
+        apply_lee_filter=apply_lee_filter, lee_window=lee_window)
+
     out["aef_pre"] = aef_composite(ti.aef_paths, pre_years, ref)
     out["aef_post"] = aef_composite(ti.aef_paths, post_years, ref)
     out["aef_delta"] = (out["aef_post"] - out["aef_pre"]).astype(np.float32)
@@ -839,7 +919,7 @@ def cache_tile(ti: TileInventory, cache_dir: Path, **kwargs) -> Path:
     return cache_path
 
 
-# Channel counts annotated per group so the total (251) stays easy to audit
+# Channel counts annotated per group so the total (274) stays easy to audit
 # when tuning the Tier-2 U-Net input stem.
 DEFAULT_FEATURE_KEYS: tuple[str, ...] = (
     "aef_pre", "aef_post", "aef_delta",                               # 3*64 = 192
@@ -862,6 +942,18 @@ DEFAULT_FEATURE_KEYS: tuple[str, ...] = (
     "s1_pre_vv_desc_median", "s1_post_vv_desc_median", "s1_delta_vv_desc",  #   3
     "s1_pre_vv_orbit_diff", "s1_post_vv_orbit_diff",                  #         2
     "forest_mask_2020",                                               #         1
+)
+
+
+# Feature layout for DANN_Temporal_UNet. The model expects the per-month
+# channels up front (so its TemporalChannelAttention can reshape to a
+# (B, T=12, C, H, W) tensor), followed by AEF delta at the tail for
+# bottleneck fusion. Total = 144 + 12 + 12 + 64 = 232 channels.
+TEMPORAL_FEATURE_KEYS: tuple[str, ...] = (
+    "s2_monthly_pre",        # 12 months × 12 bands       = 144
+    "s1_monthly_pre_asc",    # 12 months × VV (ascending) =  12
+    "s1_monthly_pre_desc",   # 12 months × VV (descending)=  12
+    "aef_delta",             # 64 AEF embedding dims      =  64
 )
 
 

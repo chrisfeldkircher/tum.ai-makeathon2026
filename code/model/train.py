@@ -16,13 +16,13 @@ class DeforestationBaseModel(nn.Module):
         self,
         architecture: str = "deeplabv3plus",
         encoder_name: str = "resnet34",
-        in_channels: int = 251,
+        in_channels: int = 274,
     ):
         super().__init__()
         self.architecture = architecture.lower()
 
-        # 251 channels means we cannot use standard ImageNet pretrained weights.
-        # We must initialize with random weights (None) for the encoder.
+        # High in_channels means we cannot use standard ImageNet pretrained
+        # weights. We must initialize with random weights (None) for the encoder.
         encoder_weights = None
 
         if self.architecture == "deeplabv3plus":
@@ -79,13 +79,13 @@ class DANN_UNet(nn.Module):
     def __init__(
         self,
         num_regions: int,
-        in_channels: int = 251,
+        in_channels: int = 274,
         encoder_name: str = "resnet34",
         domain_dropout: float = 0.3,
     ):
         super().__init__()
 
-        # For in_channels=251, pretrained imagenet weights are not directly usable.
+        # High in_channels means pretrained imagenet weights are not usable.
         self.unet = smp.Unet(
             encoder_name=encoder_name,
             encoder_weights=None,
@@ -109,7 +109,7 @@ class DANN_UNet(nn.Module):
     def forward(self, x: torch.Tensor, grl_lambda: float = 1.0) -> Dict[str, torch.Tensor]:
         # Encoder-decoder forward for segmentation
         features = self.unet.encoder(x)
-        decoder_out = self.unet.decoder(*features)
+        decoder_out = self.unet.decoder(features)
         seg_logits = self.unet.segmentation_head(decoder_out)  # [B,1,H,W]
 
         # Domain branch from bottleneck
@@ -127,7 +127,7 @@ class DANN_UNet(nn.Module):
 
 def build_model(
     model_type: str,
-    in_channels: int = 251,
+    in_channels: int = 274,
     encoder_name: str = "resnet34",
     architecture: str = "deeplabv3plus",
     num_regions: Optional[int] = None,
