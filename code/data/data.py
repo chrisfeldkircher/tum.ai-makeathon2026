@@ -922,6 +922,10 @@ def preprocess_tile(
         )
 
     out["_shape"] = np.array([ref.height, ref.width], dtype=np.int32)
+    # Geo-referencing metadata — required by the submission export step to
+    # reconstruct a valid GeoTIFF for raster_to_geojson (submission_utils.py).
+    out["_crs_wkt"]   = np.bytes_(ref.crs.to_wkt())
+    out["_transform"] = np.array(ref.transform[:6], dtype=np.float64)
     return out
 
 
