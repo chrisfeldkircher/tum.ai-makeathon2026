@@ -1,0 +1,39 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "time_step": 2401
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [11.0000, 48.0000],
+            [11.0200, 48.0000],
+            [11.0200, 48.0200],
+            [11.0000, 48.0200],
+            [11.0000, 48.0000]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [11.0300, 48.0100],
+            [11.0450, 48.0100],
+            [11.0450, 48.0250],
+            [11.0300, 48.0250],
+            [11.0300, 48.0100]
+          ]
+        ]
+      }
+    }
+  ]
+}
