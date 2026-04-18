@@ -128,7 +128,7 @@ Not sensor data, but worth stating their nature: **RADD, GLAD-L, and GLAD-S2 are
 
 ## Cache contents — what `preprocess_tile` produces
 
-Each tile's `.npz` cache holds the tensors below. Train tiles have 49 keys, test tiles 46 (no labels), plus 4 more if `augment_cache_with_ndvi_drop` has been run. Everything is `float32` / `(H, W)` unless noted. `(H, W)` is set by the largest S2 scene in the tile (typically ~1004×1004 ≈ 1 M pixels). Pre-cutoff windows use 2019–2020; post-cutoff uses 2021–2024.
+Each tile's `.npz` cache holds the tensors below. After Phase 2, train tiles have **63 keys**, test tiles **60** (no labels), plus 4 more if `augment_cache_with_ndvi_drop` has been run. Everything is `float32` / `(H, W)` unless noted. `(H, W)` is set by the largest S2 scene in the tile (typically ~1004×1004 ≈ 1 M pixels). Pre-cutoff windows use 2019–2020; post-cutoff uses 2021–2024.
 
 ### AlphaEarth embeddings — the global prior
 
@@ -150,6 +150,27 @@ All of these exist in both median and std flavours, pre and post, plus a delta:
 - **`s2_{pre,post}_ndmi_{median,std}`** — canopy water content. Drops with drought and clearing.
 - **`s2_{pre,post}_evi_{median,std}`** — EVI, saturates less than NDVI in dense canopy.
 - **`s2_delta_{ndvi,nbr,ndmi,evi}`** — post-median minus pre-median. The cheapest possible "where did greenness fall" feature. A deforested pixel shows a strongly negative NDVI delta.
+
+**Phase 2 nodata fix.** Indices are now computed with a per-scene validity mask derived from `B08 > 0`. Previously `_safe_div` turned black-border padding (nodata) into NDVI ≈ 0, which dragged medians and especially trajectory percentiles toward zero on partial-coverage tiles. Now those pixels are NaN and skipped by the nan-aware reductions. Effect is largest on edge pixels and cloudy tiles.
+
+### Sentinel-2 pre-period trajectory — how does this pixel *behave*, not just look
+
+Median composites throw away everything except the central tendency. For forest-mask prediction specifically, "this pixel's NDVI dropped from 0.85 to 0.65 over 2019–2020" is a very different signal than "this pixel has median NDVI 0.75" — the first is degrading canopy, the second is stable forest. These features expose the per-pixel trajectory across the pre-cutoff scene stack.
+
+- **`s2_pre_{ndvi,nbr,ndmi}_p10`**, **`_p90`** — 10th / 90th percentile across valid pre-scenes. `p10` surfaces the worst spectral state a pixel reached (transient stress, drought, partial clearing missed by median); `p90` is a robust peak-greenness proxy.
+- **`s2_pre_{ndvi,nbr,ndmi}_slope`** — per-pixel linear slope across scene-index (0, 1, …, T−1). Negative slope on NDVI/NBR ⇒ the pixel was already losing canopy before 2021 — a weak forest claim. Slope is 0 for pixels with < 3 valid scenes.
+- **`s2_pre_n_scenes_valid`** — valid scene count per pixel in the pre-cutoff window. A tile-edge pixel with only 3 valid scenes is a far weaker "forest" witness than an interior pixel with 24; trees can use this directly to discount the other trajectory features.
+
+EVI is excluded from trajectory stats — it's a derived combination of bands the other indices already cover, and the extra channels aren't worth the compute.
+
+### Sentinel-2 pre-period neighborhood context
+
+A pixel's appearance alone doesn't distinguish "isolated bright cropland pixel" from "pixel inside a contiguous forest patch". These neighborhood means expose spatial context directly so the tree model doesn't have to rediscover it from coordinates.
+
+- **`s2_pre_{ndvi,nbr}_nh9`** — 9×9 neighborhood mean of the pre-median. Zero/nodata pixels are excluded and the mean is reweighted by the local valid count, so tile edges don't bias the signal toward zero.
+- **`s2_pre_{ndvi,nbr}_nh21`** — same but at 21×21 (~210 m at 10 m/pixel) for a broader regional context.
+
+These two scales together let the model tell "surrounded by contiguous forest" (both high), "forest/non-forest edge" (nh9 ≠ nh21), and "isolated bright pixel in non-forest" (both low while the pixel itself is high).
 
 ### Sentinel-1 VV backscatter (dB)
 
@@ -188,7 +209,7 @@ Timing separates abrupt clearing from gradual phenological decline — informati
 
 ### Channel budget at feature stacking
 
-`DEFAULT_FEATURE_KEYS` yields **260 channels** before Phase 2/3 additions:
+`DEFAULT_FEATURE_KEYS` yields **274 channels** post-Phase-2:
 
 | Group | Channels |
 | --- | --- |
@@ -197,11 +218,14 @@ Timing separates abrupt clearing from gradual phenological decline — informati
 | S2 band std (pre + post) | 24 |
 | S2 delta indices (4) | 4 |
 | S2 pre/post index medians (ndvi + nbr × 2) | 4 |
+| **S2 pre trajectory** (ndvi/nbr/ndmi × p10/p90/slope) | **9** |
+| **S2 pre n_scenes_valid** | **1** |
+| **S2 pre neighborhood** (ndvi/nbr × nh9/nh21) | **4** |
 | S1 combined (pre/post/delta) | 3 |
 | S1 ascending (pre/post/delta) | 3 |
 | S1 descending (pre/post/delta) | 3 |
 | S1 orbit_diff (pre + post) | 2 |
 | `forest_mask_2020` | 1 |
-| **Total** | **260** |
+| **Total** | **274** |
 
-Phase 2 will add NDVI temporal trajectory (min/max/p10/p90/slope/n_valid), NBR/NDMI trajectories, and 9×9 / 21×21 neighborhood medians of NDVI and NBR — expect the budget to grow to ~290. Phase 3 MAESTRO adds one `maestro_emb` block of D channels (D = 512 or 768 depending on checkpoint) plus a scalar `forest_centroid_distance`, pushing it past 800 total before any reduction.
+Phase 3 (MAESTRO enrichment) will add one `maestro_emb` block of D channels (D = 512 or 768 depending on checkpoint) plus a scalar `forest_centroid_distance`, pushing the budget past 800 total before any reduction. Hard-negative mining in the masker's `_build_xy` consumes the centroid distance but does not feed MAESTRO embeddings directly into the masker.

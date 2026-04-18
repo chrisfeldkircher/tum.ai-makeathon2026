@@ -26,12 +26,11 @@ Never pick a single source. Build one consolidated label per tile:
 - Consensus rule: **majority vote** (alert if ≥2 of 3 sources agree), with a weighted variant (RADD + GLAD-S2 higher weight, GLAD-L lower since it's Landsat-resolution).
 - Optionally emit a `label_confidence` channel (0 / 0.33 / 0.66 / 1.0) to use as sample weight in training.
 
-### 4. Forest mask (2020) — **DONE**
+### 4. Forest mask (2020) — **in iterative refinement (Phase 0–4)**
 
-Shipped as [`LearnedForestMasker`](code/model/vegetationPredictor.py) (LightGBM). See [README §3](README.md) for the full validation story; summary:
+Shipped as [`LearnedForestMasker`](code/model/vegetationPredictor.py) (LightGBM). The static aggregate number in the original README (recall 0.982 / coverage 0.775 on 10 tiles) was measured *train-on-test*; the real number from LOOCV on 14 gold-labeled tiles is considerably more honest. Current state after Phase 2:
 
-- **Aggregate on 10 train tiles: recall 0.982, coverage 0.775.**
-- Beats the NDVI+NBR heuristic (0.973 / 0.743) and rescues 62.7% of degraded-forest pixels the heuristic misses on the worst tile.
+- **LOOCV, 14 folds: recall 0.955 ± 0.042 (min 0.875, max 0.999)** — up from the Phase 0 baseline of 0.943 ± 0.052 (min 0.830). Phase 1 added strict confidence + NDVI spectral gate to `build_forest_ground_truth`; Phase 2 added per-pixel trajectory stats and neighborhood means (see below).
 - Trained with a PU-learning fix: negatives include both *stable-low* (bare/water/urban) and *seasonal* (high NDVI std) pixels, so pasture isn't silently dragged onto the forest side of the boundary.
 - Exposes 4 confidence tiers (NON / UNCERTAIN / SOFT / STRONG) via `predict_tiers`.
 
@@ -46,6 +45,32 @@ Shipped as [`LearnedForestMasker`](code/model/vegetationPredictor.py) (LightGBM)
 
 ### 5. Submission pipeline
 Get `raster_to_geojson` running end-to-end on the training tiles on **day 1**, before touching any model. Submission-format bugs eat more time than modelling bugs.
+
+---
+
+## Phase Work Log — Forest Masker Refinement
+
+The forest masker is the upstream gate for everything else; every false-forest pixel becomes a bogus deforestation candidate downstream, so pushing recall on this one model compounds into the submission metric. Work is split into four phases, each gated by a leave-one-tile-out CV check against the Phase 0 baseline so we can tell real wins from lucky tile splits.
+
+| Phase | Scope | Status | CV recall (mean ± std, min) |
+| --- | --- | --- | --- |
+| **0** | Fix broken-tile ingest (18NYH_9_9 hard-skip), audit S1 asc/desc handling, build LOOCV harness | Done | **0.943 ± 0.052, min 0.830** (15 folds initially, later 14 after label gate) |
+| **1** | Strict confidence + NDVI spectral gate in `build_forest_ground_truth` | Done | **0.955 ± 0.042, min 0.875** (14 folds) |
+| **2** | Per-pixel NDVI/NBR/NDMI trajectory (p10/p90/slope), neighborhood means (9×9 / 21×21), B08 nodata fix for indices | Done — awaiting re-cache + CV | *pending* |
+| **3** | MAESTRO cached enrichment: per-tile positive-centroid distance for hard-negative mining in `_build_xy`; feed embeddings to downstream segmenter, not the masker | Pending | — |
+| **4** | Threshold sweep + isotonic calibration (sklearn `CalibratedClassifierCV`), refit tier boundaries | Pending | — |
+
+**Why LOOCV and not a single fixed holdout.** Training set is tiny (14 tiles with labels). Any single holdout split is hostage to one tile's biome; a change that looks like +0.02 recall on one split can be −0.02 on the next. LOOCV gives a 14-fold distribution and a concrete `recall_min` we can monitor — improvements on the worst fold are more meaningful than improvements on the mean.
+
+**Noise floor.** At 14 folds with std ~0.04, the 2σ band on the mean is roughly ±0.021. A mean-recall change below that is indistinguishable from fold-shuffling noise. `recall_min` and `recall_std` are the useful signals for small changes — Phase 1 moved the mean by 0.012 (at the noise floor) but the min by 0.045 and collapsed the tail, which is the real win.
+
+**Phase 2 details.**
+
+- `_pixel_slope` — vectorised per-pixel linear regression across the pre-period scene stack, NaN-skipping, scene-index time. Output is 0 where fewer than 3 scenes are valid.
+- `_neighborhood_mean` — 9×9 and 21×21 uniform filter with explicit nodata handling (exact-0 excluded, mean reweighted by local valid-pixel count). Prevents tile edges from biasing the neighborhood signal toward zero.
+- `s2_temporal_composite(compute_trajectory=True)` — emits `{idx}_p10 / _p90 / _slope` for NDVI/NBR/NDMI plus a shared `n_scenes_valid` alongside the existing medians/stds.
+- **Nodata fix.** Previously `_safe_div` returned NDVI ≈ 0 for black-border pixels (B08 = 0 after reproject fill), which dragged medians — and p10 especially — on partial-coverage tiles. Now a per-scene `B08 > 0` mask NaN's those pixels out of every index before the reduction. This is why Phase 2 requires a full cache rebuild, not just the new keys.
+- 14 new channels in `DEFAULT_FEATURE_KEYS` (9 trajectory + 1 n_valid + 4 neighborhood) → stack is now 274 channels. `_LEARNED_FEATURE_KEYS` picks them up.
 
 ---
 
