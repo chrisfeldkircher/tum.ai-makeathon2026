@@ -98,7 +98,7 @@ class DANN_UNet(nn.Module):
     def forward(self, x: torch.Tensor, grl_lambda: float = 1.0) -> Dict[str, torch.Tensor]:
         # Encoder-decoder forward for segmentation
         features = self.unet.encoder(x)                     # list of feature maps
-        decoder_out = self.unet.decoder(*features)          # highest-res decoder feature
+        decoder_out = self.unet.decoder(features)       # highest-res decoder feature
         seg_logits = self.unet.segmentation_head(decoder_out)  # [B,1,H,W]
 
         # Domain branch from bottleneck
