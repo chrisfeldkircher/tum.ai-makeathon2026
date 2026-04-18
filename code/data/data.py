@@ -1201,6 +1201,7 @@ class DeforestationPatchDataset(Dataset):
         cache_paths: list[Path],
         feature_keys: tuple[str, ...] = DEFAULT_FEATURE_KEYS,
         probs_dir: Path | str = "./cache_probs",
+        strict_prob_sidecar: bool = False,
         patch_size: int = 256,
         patches_per_tile: int = 8,
         positive_ratio: float = 0.5,
@@ -1212,11 +1213,13 @@ class DeforestationPatchDataset(Dataset):
         self.cache_paths = list(cache_paths)
         self.feature_keys = feature_keys
         self.probs_dir = Path(probs_dir)
+        self.strict_prob_sidecar = strict_prob_sidecar
         self.patch_size = patch_size
         self.patches_per_tile = patches_per_tile
         self.positive_ratio = positive_ratio
         self.is_train = is_train
         self.rng = np.random.default_rng(seed)
+        self._missing_prob_warned_tiles: set[str] = set()
 
     def __len__(self) -> int:
         if not self.is_train:
@@ -1225,10 +1228,42 @@ class DeforestationPatchDataset(Dataset):
 
     def _load(self, idx: int) -> dict[str, np.ndarray]:
         tile_idx = idx // self.patches_per_tile if self.is_train else idx
+        tile_id = self.cache_paths[tile_idx].stem
         with np.load(self.cache_paths[tile_idx], allow_pickle=False) as npz:
             tensors = {k: npz[k] for k in npz.files}
         if _needs_prob_sidecar(self.feature_keys):
-            tensors.update(load_probability_sidecar(self.cache_paths[tile_idx].stem, self.probs_dir))
+            try:
+                tensors.update(load_probability_sidecar(tile_id, self.probs_dir))
+            except FileNotFoundError:
+                if self.strict_prob_sidecar:
+                    raise
+
+                if "_shape" in tensors and tensors["_shape"].size >= 2:
+                    H, W = int(tensors["_shape"][0]), int(tensors["_shape"][1])
+                else:
+                    spatial_key = next(
+                        (k for k, v in tensors.items() if v.ndim >= 2),
+                        None,
+                    )
+                    if spatial_key is None:
+                        raise RuntimeError(
+                            f"{tile_id}: could not infer spatial shape for probability fallback."
+                        )
+                    arr = tensors[spatial_key]
+                    H, W = int(arr.shape[-2]), int(arr.shape[-1])
+
+                for k in PROB_FEATURE_KEYS:
+                    tensors.setdefault(k, np.zeros((H, W), dtype=np.float32))
+
+                if tile_id not in self._missing_prob_warned_tiles:
+                    logger.warning(
+                        "%s: missing probability sidecar under %s — using zero-filled %s channels. "
+                        "Set strict_prob_sidecar=True to raise instead.",
+                        tile_id,
+                        self.probs_dir.resolve(),
+                        ",".join(PROB_FEATURE_KEYS),
+                    )
+                    self._missing_prob_warned_tiles.add(tile_id)
         return tensors
 
     def _sample_crop(self, label: np.ndarray, forest: np.ndarray) -> tuple[int, int]:
