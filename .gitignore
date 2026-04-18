@@ -63,5 +63,5 @@ logs/
 wandb/
 mlruns/
 lightning_logs/
-.claude
-data.claude/
+.claude/
+references/

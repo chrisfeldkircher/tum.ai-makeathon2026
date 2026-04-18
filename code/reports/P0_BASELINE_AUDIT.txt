@@ -1,8 +1,0 @@
-[P0] audit on 16 tiles (includes test tiles without ground truth) from cache
-[P0] per-tile stats collected · shapes={(1002, 1002): 3, (1004, 1004): 1, (1012, 1006): 1, (1006, 1006): 1, (1016, 1016): 1, (1020, 1020): 1, (1008, 1008): 1, (1004, 1003): 1} · zones={'18N': 4, '48P': 4, '48Q': 2}
-[P0] representative tile: 48PWV_7_8  (GT=45.90%)
-[P0] per-dim AEF stats aggregated across 10 tiles
-[P0] skipping figures (--skip_figs)
-[P0] wrote report -> code\reports\data_stats.md
-
-[P0] [PASS] all sanity checks passed.
