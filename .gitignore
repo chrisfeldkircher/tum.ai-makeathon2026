@@ -1,9 +1,11 @@
 # Raw challenge data (downloaded via `make download_data_from_s3`)
 data/
 !code/data/
-cache/
+cache*/
 cache.zip
 content/
+maestro/
+
 maestro/
 
 # Python bytecode & caches

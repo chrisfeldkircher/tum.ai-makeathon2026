@@ -33,7 +33,7 @@ import logging
 import re
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -84,6 +84,13 @@ GLADS2_EPOCH  = date(2019, 1, 1)
 
 DEFAULT_PRE_YEARS  = (2019, 2020)
 DEFAULT_POST_YEARS = (2021, 2022, 2023, 2024)
+
+# Tiles where the raw Sentinel-2 provider shipped unusable scenes and no amount
+# of reference-grid / partial-scene logic can recover them. Verified via the
+# `debug_data.py` scan (see 2026-04 triage).
+#   18NYH_9_9: 71/72 scenes are 4x6 or 1004x6 slivers; the single full-size
+#     1004x1004 scene (2020-10) is 100% cloud (p50=6084). Nothing to composite.
+BROKEN_TILES: frozenset[str] = frozenset({"18NYH_9_9"})
 
 
 TILE_ID_RE = re.compile(r"^[A-Z0-9]+_\d+_\d+$")
@@ -273,28 +280,54 @@ def _load_s2_normalised(path: Path, ref: ReferenceGrid) -> np.ndarray:
     return np.clip(arr, 0.0, 1.5)
 
 
-def s2_temporal_composite(paths: Iterable[Path], ref: ReferenceGrid) -> dict[str, np.ndarray]:
+def s2_temporal_composite(
+    paths: Iterable[Path],
+    ref: ReferenceGrid,
+    compute_trajectory: bool = False,
+    trajectory_indices: tuple[str, ...] = ("ndvi", "nbr", "ndmi"),
+) -> dict[str, np.ndarray]:
     """Median + std composite across a set of S2 scenes.
 
-    Returns a dict with keys:
+    Always returns:
         'band_median' (12, H, W), 'band_std' (12, H, W),
-        'ndvi_median', 'ndvi_std', ... (H, W) per index.
-    Missing-data pixels (value 0) are ignored in the reduction.
+        '<idx>_median', '<idx>_std' for idx ∈ {ndvi, nbr, ndmi, evi}.
+
+    When `compute_trajectory=True`, additionally emits for each idx in
+    `trajectory_indices`:
+        '<idx>_p10', '<idx>_p90', '<idx>_slope'
+        'n_scenes_valid'  (shared across all trajectory indices)
+
+    Missing pixels (B08 == 0 from the reproject fill) are treated as NaN for
+    every index so medians and especially p10 aren't dragged toward zero by
+    black-border padding. Previously indices were computed with `_safe_div`
+    which turns nodata into a finite zero, biasing the median of partial-
+    coverage tiles — this fixes that.
     """
     stacks, index_stacks = [], {"ndvi": [], "nbr": [], "ndmi": [], "evi": []}
     for p in paths:
         s2 = _load_s2_normalised(p, ref)
         stacks.append(s2)
+        band_valid = s2[S2_BANDS["B08"] - 1] > 0  # per-scene nodata mask
         idx = compute_indices(s2)
         for k, v in idx.items():
-            index_stacks[k].append(v)
+            index_stacks[k].append(
+                np.where(band_valid & np.isfinite(v), v, np.nan))
 
     if not stacks:
         empty = np.zeros((S2_N_BANDS, ref.height, ref.width), dtype=np.float32)
         empty_idx = np.zeros((ref.height, ref.width), dtype=np.float32)
-        return {"band_median": empty, "band_std": empty,
-                **{f"{k}_median": empty_idx.copy() for k in index_stacks},
-                **{f"{k}_std":    empty_idx.copy() for k in index_stacks}}
+        out: dict[str, np.ndarray] = {
+            "band_median": empty, "band_std": empty,
+            **{f"{k}_median": empty_idx.copy() for k in index_stacks},
+            **{f"{k}_std":    empty_idx.copy() for k in index_stacks},
+        }
+        if compute_trajectory:
+            for k in trajectory_indices:
+                out[f"{k}_p10"]   = empty_idx.copy()
+                out[f"{k}_p90"]   = empty_idx.copy()
+                out[f"{k}_slope"] = empty_idx.copy()
+            out["n_scenes_valid"] = empty_idx.copy()
+        return out
 
     stk = np.stack(stacks, axis=0)
     mask = stk > 0
@@ -305,16 +338,68 @@ def s2_temporal_composite(paths: Iterable[Path], ref: ReferenceGrid) -> dict[str
     band_median = np.nan_to_num(band_median, nan=0.0)
     band_std    = np.nan_to_num(band_std,    nan=0.0)
 
-    out: dict[str, np.ndarray] = {"band_median": band_median, "band_std": band_std}
+    out = {"band_median": band_median, "band_std": band_std}
     for k, lst in index_stacks.items():
         ik = np.stack(lst, axis=0)
-        ik_ma = np.where(np.isfinite(ik), ik, np.nan)
         with _quiet_nan_reductions():
-            med = np.nanmedian(ik_ma, axis=0)
-            std = np.nanstd(ik_ma, axis=0)
+            med = np.nanmedian(ik, axis=0)
+            std = np.nanstd(ik, axis=0)
         out[f"{k}_median"] = np.nan_to_num(med, nan=0.0).astype(np.float32)
         out[f"{k}_std"]    = np.nan_to_num(std, nan=0.0).astype(np.float32)
+
+        if compute_trajectory and k in trajectory_indices:
+            with _quiet_nan_reductions():
+                p10 = np.nanpercentile(ik, 10, axis=0)
+                p90 = np.nanpercentile(ik, 90, axis=0)
+            out[f"{k}_p10"]   = np.nan_to_num(p10, nan=0.0).astype(np.float32)
+            out[f"{k}_p90"]   = np.nan_to_num(p90, nan=0.0).astype(np.float32)
+            out[f"{k}_slope"] = _pixel_slope(ik)
+
+    if compute_trajectory:
+        # Valid-scene count is shared across all indices because they live on
+        # the same scene cadence (they're derived from the same B08 mask).
+        ik = np.stack(index_stacks["ndvi"], axis=0)
+        out["n_scenes_valid"] = np.isfinite(ik).sum(axis=0).astype(np.float32)
+
     return out
+
+
+def _pixel_slope(stk_ma: np.ndarray) -> np.ndarray:
+    """Per-pixel linear slope across a (T, H, W) stack. NaN observations are
+    skipped. Time axis is scene-index (0..T-1), not calendar days — cadence is
+    roughly monthly and we want the tree model to see "is this pixel trending
+    down over the 2019–2020 window". Pixels with < 3 valid scenes return 0.
+    """
+    T = stk_ma.shape[0]
+    valid = np.isfinite(stk_ma)
+    n = valid.sum(axis=0).astype(np.float32)
+    t = np.arange(T, dtype=np.float32).reshape(T, 1, 1)
+
+    with _quiet_nan_reductions():
+        t_mean = np.nanmean(np.where(valid, t, np.nan), axis=0)
+        y_mean = np.nanmean(stk_ma, axis=0)
+
+    y_filled = np.where(valid, stk_ma, 0.0)
+    t_dev = np.where(valid, t - t_mean[None], 0.0)
+    y_dev = np.where(valid, y_filled - y_mean[None], 0.0)
+    num = (t_dev * y_dev).sum(axis=0)
+    den = (t_dev * t_dev).sum(axis=0)
+    slope = np.where(den > 1e-6, num / den, 0.0)
+    slope = np.where(n >= 3, slope, 0.0)
+    return np.nan_to_num(slope, nan=0.0).astype(np.float32)
+
+
+def _neighborhood_mean(a: np.ndarray, size: int) -> np.ndarray:
+    """Uniform-kernel mean over (H, W), treating exact zeros as nodata and
+    reweighting by the local valid-pixel count. Exact-zero is the composite
+    convention for missing coverage, so not filtering lets tile edges pull
+    the mean toward zero and destroys the "am I surrounded by forest" signal.
+    """
+    valid = np.isfinite(a) & (a != 0)
+    a_f = np.where(valid, a, 0.0).astype(np.float32)
+    num = ndi_uniform(a_f, size, mode="reflect")
+    den = ndi_uniform(valid.astype(np.float32), size, mode="reflect")
+    return np.where(den > 0.0, num / den, 0.0).astype(np.float32)
 
 
 def lee_filter(img: np.ndarray, size: int = 5) -> np.ndarray:
@@ -478,29 +563,55 @@ def fuse_labels(ti: TileInventory, ref: ReferenceGrid,
     return consensus, mean_conf
 
 
-def build_forest_ground_truth(ti: TileInventory, ref: ReferenceGrid,
-                              cutoff: date = date(2021, 1, 1)) -> np.ndarray:
+def build_forest_ground_truth(
+    ti: TileInventory,
+    ref: ReferenceGrid,
+    cutoff: date = date(2021, 1, 1),
+    ndvi_pre_median: np.ndarray | None = None,
+    spectral_ndvi_min: float = 0.4,
+    strict: bool = True,
+    min_confidence: float = 0.75,
+) -> np.ndarray:
     """Free pre-2020 forest ground-truth from weak labels.
 
-    Any pixel flagged by *any* source as a post-`cutoff` deforestation alert
-    must have been forest before the alert — use this as evaluation-only
-    positives for the pre-2020 forest mask.
+    Any pixel flagged by a source as a post-`cutoff` deforestation alert must
+    have been forest before the alert — use this as evaluation-only positives
+    for the pre-2020 forest mask.
 
     Unlike `fuse_labels` (which uses ≥2-source consensus for training `y`),
     this uses the UNION because a single detector flagging loss is already
     sufficient evidence that forest existed.
 
+    Phase 1 filters
+    ---------------
+    1. **Strict confidence** (`strict=True`, default). Accept only pixels where
+       the source's confidence ≥ `min_confidence` (0.75 catches RADD high-conf,
+       GLAD-L confirmed, and GLAD-S2 codes ≥ 3). Low-confidence alerts are
+       themselves often FPs; including them as "free GT" for the masker turns
+       the recall metric into a distorted evaluation of label noise. Set
+       `strict=False` to restore the old permissive union.
+    2. **Spectral sanity gate**. If `ndvi_pre_median` is provided, AND the
+       union with `ndvi_pre_median >= spectral_ndvi_min`. A pixel that never
+       looked spectrally vegetated in 2019–2020 cannot have been forest —
+       this drops RADD-on-cropland and cloud-shadow FPs without touching
+       legitimate degraded-forest pixels (0.4 is permissive by design).
+
     Returns:
-        (H, W) uint8 — 1 where any source flagged post-cutoff loss, 0 elsewhere.
+        (H, W) uint8 — 1 where any qualifying source flagged post-cutoff loss.
     """
     cutoff_ord = cutoff.toordinal()
+    thresh = min_confidence if strict else 0.0  # 0.0 lets `c > 0` through
     gt = np.zeros((ref.height, ref.width), dtype=np.uint8)
+
+    def _include(c: np.ndarray, ord_: np.ndarray) -> np.ndarray:
+        pass_conf = (c >= thresh) if strict else (c > 0.0)
+        return pass_conf & (ord_ >= cutoff_ord)
 
     if ti.radd_path is not None:
         raw = _reproject_to(ref, ti.radd_path, bands=[1],
                             resampling=Resampling.nearest, dtype="int32")[0]
         c, ord_ = decode_radd(raw)
-        gt |= ((c > 0) & (ord_ >= cutoff_ord)).astype(np.uint8)
+        gt |= _include(c, ord_).astype(np.uint8)
 
     if ti.glads2_alert_path is not None and ti.glads2_date_path is not None:
         alert = _reproject_to(ref, ti.glads2_alert_path, bands=[1],
@@ -508,7 +619,7 @@ def build_forest_ground_truth(ti: TileInventory, ref: ReferenceGrid,
         dt = _reproject_to(ref, ti.glads2_date_path, bands=[1],
                            resampling=Resampling.nearest, dtype="int32")[0]
         c, ord_ = decode_glads2(alert, dt)
-        gt |= ((c > 0) & (ord_ >= cutoff_ord)).astype(np.uint8)
+        gt |= _include(c, ord_).astype(np.uint8)
 
     for yy in sorted(ti.gladl_alert_paths.keys()):
         d_path = ti.gladl_date_paths.get(yy)
@@ -519,7 +630,10 @@ def build_forest_ground_truth(ti: TileInventory, ref: ReferenceGrid,
         dt = _reproject_to(ref, d_path, bands=[1],
                            resampling=Resampling.nearest, dtype="int32")[0]
         c, ord_ = decode_gladl(alert, dt, yy)
-        gt |= ((c > 0) & (ord_ >= cutoff_ord)).astype(np.uint8)
+        gt |= _include(c, ord_).astype(np.uint8)
+
+    if ndvi_pre_median is not None:
+        gt &= (ndvi_pre_median >= spectral_ndvi_min).astype(np.uint8)
 
     return gt
 
@@ -540,6 +654,31 @@ def _select_paths_by_year(paths: dict, years: Iterable[int], key_year_pos: int =
     return out
 
 
+def _select_s1_by_dir(paths: dict[tuple[int, int, str], Path],
+                      years: Iterable[int], direction: str) -> list[Path]:
+    """S1 paths are keyed by (year, month, direction). Previously we flattened
+    everything into one stack and took the median — silently averaging asc and
+    desc. The two see canopy geometry differently, so we now split them."""
+    years = set(years)
+    return [v for (y, _m, d), v in paths.items() if y in years and d == direction]
+
+
+def _scene_pixel_count(p: Path) -> int:
+    with rasterio.open(p) as src:
+        return int(src.width) * int(src.height)
+
+
+def _filter_partial_scenes(paths: dict, ref_size: int, coverage: float = 0.8) -> dict:
+    """Drop scenes whose pixel count is < `coverage` of the reference size.
+
+    Partial scenes reproject into strips / half-tile patches and leave the rest
+    as zeros — those zeros then dominate medians and confuse downstream models
+    (seam artefacts, half-tile NON classifications).
+    """
+    return {k: p for k, p in paths.items()
+            if _scene_pixel_count(p) >= coverage * ref_size}
+
+
 def preprocess_tile(
     ti: TileInventory,
     pre_years: tuple[int, ...] = DEFAULT_PRE_YEARS,
@@ -547,6 +686,11 @@ def preprocess_tile(
     forest_ndvi_threshold: float = 0.6,
     apply_lee_filter: bool = False,
     lee_window: int = 5,
+    min_reference_pixels: int = 500_000,
+    partial_scene_coverage: float = 0.8,
+    gt_strict: bool = True,
+    gt_min_confidence: float = 0.75,
+    gt_spectral_ndvi_min: float = 0.4,
 ) -> dict[str, np.ndarray]:
     """Run the full preprocessing pipeline for a single tile.
 
@@ -555,26 +699,50 @@ def preprocess_tile(
         s2_pre_band_median, s2_post_band_median    — (12, H, W)
         s2_pre_band_std,    s2_post_band_std       — (12, H, W)
         s2_{pre,post}_{ndvi,nbr,ndmi,evi}_median/std — (H, W)
+        s2_pre_{ndvi,nbr,ndmi}_{p10,p90,slope}        — (H, W) pre trajectory
+        s2_pre_n_scenes_valid                         — (H, W) valid scene count
+        s2_pre_{ndvi,nbr}_{nh9,nh21}                  — (H, W) neighborhood mean
         s2_delta_{ndvi,nbr,ndmi,evi}                  — (H, W) post - pre medians
-        s1_{pre,post}_vv_median/std                   — (H, W)
-        s1_delta_vv                                   — (H, W)
+        s1_{pre,post}_vv_median/std                   — (H, W) combined asc+desc
+        s1_{pre,post}_vv_{asc,desc}_median/std        — (H, W) per-orbit
+        s1_delta_vv, s1_delta_vv_{asc,desc}           — (H, W) post - pre medians
+        s1_{pre,post}_vv_orbit_diff                   — (H, W) asc - desc median
         forest_mask_2020                              — (H, W) uint8
         label, label_confidence                       — (H, W) uint8/float32 [train only]
     """
-    # Prefer a 2020 S2 scene as reference so pre/post composites share a grid
-    # centred on the cutoff year; fall back to any available scene.
-    ref_source = next(
-        (p for (y, _m), p in sorted(ti.s2_paths.items()) if y == 2020),
-        next(iter(sorted(ti.s2_paths.values())), None),
-    )
-    if ref_source is None:
-        raise RuntimeError(f"Tile {ti.tile_id}: no Sentinel-2 scenes available — cannot establish reference grid.")
+    if ti.tile_id in BROKEN_TILES:
+        raise RuntimeError(
+            f"Tile {ti.tile_id}: listed in BROKEN_TILES — irrecoverable upstream data.")
+    if not ti.s2_paths:
+        raise RuntimeError(f"Tile {ti.tile_id}: no Sentinel-2 scenes available.")
+
+    # Pick the largest S2 scene as the reference grid. The provider ships
+    # inconsistent scene sizes per month — first-scene-wins is catastrophic
+    # when the first happens to be a 2×1004 sliver or a 4×6 thumbnail.
+    ref_source = max(ti.s2_paths.values(), key=_scene_pixel_count)
+    ref_size = _scene_pixel_count(ref_source)
+    if ref_size < min_reference_pixels:
+        raise RuntimeError(
+            f"Tile {ti.tile_id}: largest S2 scene is only {ref_size} px — "
+            f"tile is fundamentally broken, skip it.")
     ref = ReferenceGrid.from_s2(ref_source)
+
+    # Drop partial-coverage S2 scenes before building composites (prevents the
+    # right-half-zero seam artefact seen on tiles like 19NBD_4_4). We do NOT
+    # filter S1 with the same threshold: S1 ships on its own native grid with
+    # different pixel dimensions than S2, so comparing S1 scene size against
+    # the S2 reference size would drop every S1 scene (verified on 47QMB_0_8,
+    # Apr 2026 — caused an all-zero S1 composite regression).
+    ti = replace(
+        ti,
+        s2_paths=_filter_partial_scenes(ti.s2_paths, ref_size, partial_scene_coverage),
+    )
 
     out: dict[str, np.ndarray] = {}
 
     s2_pre = s2_temporal_composite(
-        _select_paths_by_year(ti.s2_paths, pre_years, key_year_pos=0), ref)
+        _select_paths_by_year(ti.s2_paths, pre_years, key_year_pos=0), ref,
+        compute_trajectory=True)
     s2_post = s2_temporal_composite(
         _select_paths_by_year(ti.s2_paths, post_years, key_year_pos=0), ref)
     for k, v in s2_pre.items():
@@ -585,6 +753,17 @@ def preprocess_tile(
         out[f"s2_delta_{idx}"] = (out[f"s2_post_{idx}_median"]
                                   - out[f"s2_pre_{idx}_median"]).astype(np.float32)
 
+    # Spatial context: a pixel's neighborhood vegetation. Helps the masker
+    # suppress isolated bright pixels (roads, cropland edges, building tops)
+    # that look forest-like in isolation but sit in non-forest surroundings.
+    for idx in ("ndvi", "nbr"):
+        base = out[f"s2_pre_{idx}_median"]
+        out[f"s2_pre_{idx}_nh9"]  = _neighborhood_mean(base, 9)
+        out[f"s2_pre_{idx}_nh21"] = _neighborhood_mean(base, 21)
+
+    # S1: split ascending / descending — canopy geometry looks different under
+    # each orbit pass, and their difference is a forest-structure signal. The
+    # combined (asc+desc) median is also kept as a backward-compat feature.
     s1_pre = s1_temporal_composite(
         _select_paths_by_year(ti.s1_paths, pre_years, key_year_pos=0), ref,
         apply_lee_filter=apply_lee_filter, lee_window=lee_window)
@@ -596,6 +775,27 @@ def preprocess_tile(
     for k, v in s1_post.items():
         out[f"s1_post_{k}"] = v
     out["s1_delta_vv"] = (out["s1_post_vv_median"] - out["s1_pre_vv_median"]).astype(np.float32)
+
+    for direction, short in (("ascending", "asc"), ("descending", "desc")):
+        s1_pre_d = s1_temporal_composite(
+            _select_s1_by_dir(ti.s1_paths, pre_years, direction), ref,
+            apply_lee_filter=apply_lee_filter, lee_window=lee_window)
+        s1_post_d = s1_temporal_composite(
+            _select_s1_by_dir(ti.s1_paths, post_years, direction), ref,
+            apply_lee_filter=apply_lee_filter, lee_window=lee_window)
+        out[f"s1_pre_vv_{short}_median"]  = s1_pre_d["vv_median"]
+        out[f"s1_pre_vv_{short}_std"]     = s1_pre_d["vv_std"]
+        out[f"s1_post_vv_{short}_median"] = s1_post_d["vv_median"]
+        out[f"s1_post_vv_{short}_std"]    = s1_post_d["vv_std"]
+        out[f"s1_delta_vv_{short}"] = (
+            s1_post_d["vv_median"] - s1_pre_d["vv_median"]).astype(np.float32)
+
+    # orbit_diff = asc - desc; zero where one orbit is absent (composite returns
+    # zeros), which LightGBM can disambiguate from the companion _median == 0.
+    out["s1_pre_vv_orbit_diff"] = (
+        out["s1_pre_vv_asc_median"] - out["s1_pre_vv_desc_median"]).astype(np.float32)
+    out["s1_post_vv_orbit_diff"] = (
+        out["s1_post_vv_asc_median"] - out["s1_post_vv_desc_median"]).astype(np.float32)
 
     out["aef_pre"] = aef_composite(ti.aef_paths, pre_years, ref)
     out["aef_post"] = aef_composite(ti.aef_paths, post_years, ref)
@@ -615,7 +815,13 @@ def preprocess_tile(
         out["label_confidence"] = conf
 
         # EVALUATION ONLY — never feed to training.
-        out["forest_gt_pre2020"] = build_forest_ground_truth(ti, ref)
+        out["forest_gt_pre2020"] = build_forest_ground_truth(
+            ti, ref,
+            ndvi_pre_median=out["s2_pre_ndvi_median"],
+            spectral_ndvi_min=gt_spectral_ndvi_min,
+            strict=gt_strict,
+            min_confidence=gt_min_confidence,
+        )
 
     out["_shape"] = np.array([ref.height, ref.width], dtype=np.int32)
     return out
@@ -642,7 +848,19 @@ DEFAULT_FEATURE_KEYS: tuple[str, ...] = (
     "s2_delta_ndvi", "s2_delta_nbr", "s2_delta_ndmi", "s2_delta_evi", #         4
     "s2_pre_ndvi_median", "s2_pre_nbr_median",
     "s2_post_ndvi_median", "s2_post_nbr_median",                      #         4
+    # Pre-period trajectory stats — p10 catches transient stress that a median
+    # hides; slope catches gradual degradation. NDMI adds moisture context.
+    "s2_pre_ndvi_p10", "s2_pre_ndvi_p90", "s2_pre_ndvi_slope",
+    "s2_pre_nbr_p10",  "s2_pre_nbr_p90",  "s2_pre_nbr_slope",
+    "s2_pre_ndmi_p10", "s2_pre_ndmi_p90", "s2_pre_ndmi_slope",        #         9
+    "s2_pre_n_scenes_valid",                                          #         1
+    # Neighborhood means — spatial context for isolated-pixel suppression.
+    "s2_pre_ndvi_nh9", "s2_pre_ndvi_nh21",
+    "s2_pre_nbr_nh9",  "s2_pre_nbr_nh21",                             #         4
     "s1_pre_vv_median", "s1_post_vv_median", "s1_delta_vv",           #         3
+    "s1_pre_vv_asc_median",  "s1_post_vv_asc_median",  "s1_delta_vv_asc",   #   3
+    "s1_pre_vv_desc_median", "s1_post_vv_desc_median", "s1_delta_vv_desc",  #   3
+    "s1_pre_vv_orbit_diff", "s1_post_vv_orbit_diff",                  #         2
     "forest_mask_2020",                                               #         1
 )
 

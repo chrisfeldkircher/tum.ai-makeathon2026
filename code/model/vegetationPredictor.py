@@ -117,7 +117,21 @@ _LEARNED_FEATURE_KEYS: tuple[str, ...] = (
     "s2_pre_nbr_median",  "s2_pre_nbr_std",
     "s2_pre_ndmi_median", "s2_pre_ndmi_std",
     "s2_pre_evi_median",  "s2_pre_evi_std",
-    "s1_pre_vv_median",   "s1_pre_vv_std",
+    # Trajectory percentiles + slope across the pre-period scene stack. p10
+    # exposes transient stress that the median smooths away; slope catches
+    # gradual degradation that looked like forest in 2019 but wasn't by 2021.
+    "s2_pre_ndvi_p10", "s2_pre_ndvi_p90", "s2_pre_ndvi_slope",
+    "s2_pre_nbr_p10",  "s2_pre_nbr_p90",  "s2_pre_nbr_slope",
+    "s2_pre_ndmi_p10", "s2_pre_ndmi_p90", "s2_pre_ndmi_slope",
+    "s2_pre_n_scenes_valid",
+    # Neighborhood means — spatial context for isolated-pixel suppression.
+    "s2_pre_ndvi_nh9", "s2_pre_ndvi_nh21",
+    "s2_pre_nbr_nh9",  "s2_pre_nbr_nh21",
+    # Per-orbit S1 — ascending/descending see canopy geometry differently
+    # and the diff is an additional forest-structure signal.
+    "s1_pre_vv_asc_median",  "s1_pre_vv_asc_std",
+    "s1_pre_vv_desc_median", "s1_pre_vv_desc_std",
+    "s1_pre_vv_orbit_diff",
 )
 
 
@@ -130,11 +144,10 @@ def _per_pixel_features(tensors: dict[str, np.ndarray],
         if k in tensors:
             feats.append(tensors[k].reshape(-1))
     if include_aef and "aef_pre" in tensors:
-        aef = tensors["aef_pre"]
-        # Use channel-wise mean/std as a cheap summary of the 64-dim AEF stack
-        # — feeding all 64 channels explodes the training-pixel matrix.
-        feats.append(aef.mean(axis=0).reshape(-1))
-        feats.append(aef.std(axis=0).reshape(-1))
+        # AEF land-cover signal is concentrated in a small subset of the 64 dims
+        # (arxiv 2603.16911); let the tree model pick which — don't pre-collapse.
+        aef = tensors["aef_pre"]  # (64, H, W)
+        feats.extend(aef[i].reshape(-1) for i in range(aef.shape[0]))
     return np.stack(feats, axis=1).astype(np.float32)
 
 
@@ -372,6 +385,130 @@ def evaluate_masker_on_tiles(masker, cache_paths: list[Path | str]) -> dict[str,
         "n_tiles":          len(per_tile),
     }
     return {"per_tile": per_tile, "aggregate": aggregate}
+
+
+def evaluate_masker_cv(
+    masker_cls,
+    cache_paths: list[Path | str],
+    masker_kwargs: dict | None = None,
+    seed: int = 0,
+    verbose: bool = True,
+) -> dict:
+    """Leave-one-tile-out CV for any `LearnedForestMasker`-like class.
+
+    Why this exists
+    ---------------
+    `evaluate_masker_on_tiles` fits and evaluates on the same tiles — recall
+    numbers from that are optimistic. A single number hides tile-level variance,
+    so a gain from one tweak can be an artefact of the tile distribution, not
+    a real improvement. LOOCV gives both a less-biased point estimate AND the
+    per-fold spread needed to tell real wins from noise.
+
+    Protocol
+    --------
+    For each tile T with `forest_gt_pre2020` present:
+      1. Build (X, y) on every other tile.
+      2. Fit a fresh masker on that concatenated matrix.
+      3. Predict on T, score `recall_vs_alerts` vs T's GT.
+    Report per-fold + mean/std/min/max summary.
+
+    Implementation note: `_build_xy` is deterministic under a fixed seed, so
+    we precompute (X, y) per tile once and slice across folds. This saves
+    ~(N_tiles - 1) re-extractions. Held-out tensors are loaded fresh per fold
+    since full tensor dicts are heavy (~1 GB each at 250 channels).
+
+    Parameters
+    ----------
+    masker_cls : class — e.g. `LearnedForestMasker`. Must expose `_build_xy`,
+                 `_fit_backend`, and `predict`.
+    cache_paths : iterable of `.npz` paths.
+    masker_kwargs : dict forwarded to `masker_cls(**kwargs)` each fold.
+    seed : controls the `_build_xy` pixel sampling (shared across folds).
+    verbose : log per-fold results as we go (useful for long runs).
+
+    Returns
+    -------
+    dict with keys:
+        per_fold : list of {held_out, recall, coverage, n_gt, n_tp,
+                            n_train_tiles, n_train_pixels}
+        summary  : {recall_mean, recall_std, recall_min, recall_max,
+                    coverage_mean, coverage_std, n_folds}
+    """
+    masker_kwargs = dict(masker_kwargs or {})
+    rng = np.random.default_rng(seed)
+
+    # Precompute per-tile (X, y) once. Skip tiles without GT — those are test
+    # tiles and can't participate as a fold.
+    per_tile: dict[str, tuple[Path, np.ndarray, np.ndarray]] = {}
+    for p in cache_paths:
+        p = Path(p)
+        with np.load(p, allow_pickle=False) as npz:
+            tensors = {k: npz[k] for k in npz.files}
+        if "forest_gt_pre2020" not in tensors:
+            continue
+        probe = masker_cls(**masker_kwargs)
+        pair = probe._build_xy(tensors, rng)
+        if pair is None:
+            if verbose:
+                print(f"  skipping {p.stem}: _build_xy returned None "
+                      f"(no positives or no negatives)")
+            continue
+        per_tile[p.stem] = (p, pair[0], pair[1])
+
+    if len(per_tile) < 2:
+        raise RuntimeError(
+            f"Need ≥2 tiles with GT for CV; only {len(per_tile)} available.")
+
+    fold_records: list[dict] = []
+    tile_ids = sorted(per_tile.keys())
+    for held_out in tile_ids:
+        train_ids = [t for t in tile_ids if t != held_out]
+        train_X = np.concatenate([per_tile[t][1] for t in train_ids], axis=0)
+        train_Y = np.concatenate([per_tile[t][2] for t in train_ids], axis=0)
+        train_X = np.clip(train_X, -1e3, 1e3)
+
+        masker = masker_cls(**masker_kwargs)
+        masker._fit_backend(train_X, train_Y)
+
+        held_path = per_tile[held_out][0]
+        with np.load(held_path, allow_pickle=False) as npz:
+            tensors = {k: npz[k] for k in npz.files}
+        mask = masker.predict(tensors)
+        ev = evaluate_mask(mask, tensors["forest_gt_pre2020"])
+
+        fold_records.append({
+            "held_out": held_out,
+            "recall": ev.recall_vs_alerts,
+            "coverage": ev.mask_coverage,
+            "n_gt": ev.n_alert_pixels,
+            "n_tp": ev.n_alert_in_mask,
+            "n_train_tiles": len(train_ids),
+            "n_train_pixels": int(len(train_Y)),
+        })
+        if verbose:
+            print(f"  fold held={held_out:<12} recall={ev.recall_vs_alerts:.3f}  "
+                  f"coverage={ev.mask_coverage:.3f}  "
+                  f"n_gt={ev.n_alert_pixels:>8,}  "
+                  f"train={len(train_Y):,}px from {len(train_ids)} tiles")
+
+    recalls = np.array([r["recall"] for r in fold_records
+                        if np.isfinite(r["recall"])])
+    coverages = np.array([r["coverage"] for r in fold_records])
+    summary = {
+        "recall_mean":   float(recalls.mean())   if recalls.size else float("nan"),
+        "recall_std":    float(recalls.std())    if recalls.size else float("nan"),
+        "recall_min":    float(recalls.min())    if recalls.size else float("nan"),
+        "recall_max":    float(recalls.max())    if recalls.size else float("nan"),
+        "coverage_mean": float(coverages.mean()) if coverages.size else float("nan"),
+        "coverage_std":  float(coverages.std())  if coverages.size else float("nan"),
+        "n_folds":       len(fold_records),
+        "n_valid_recall_folds": int(recalls.size),
+    }
+    if verbose:
+        print(f"\n  summary: recall = {summary['recall_mean']:.3f} "
+              f"± {summary['recall_std']:.3f}  "
+              f"(min={summary['recall_min']:.3f}, max={summary['recall_max']:.3f})")
+    return {"per_fold": fold_records, "summary": summary}
 
 
 def sweep_ndvi_threshold(cache_paths: list[Path | str],
