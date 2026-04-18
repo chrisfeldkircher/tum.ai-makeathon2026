@@ -876,7 +876,21 @@ def stack_features(tensors: dict[str, np.ndarray],
         chans.append(a.astype(np.float32))
     return np.concatenate(chans, axis=0)
 
-ZONE_MAPPING = {zone: i for i, zone in enumerate(["18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29",])}
+_MGRS_PREFIX_RE = re.compile(r"^(\d{2})[A-Z]{3}$")
+
+
+def tile_id_to_region_label(tile_id: str) -> int:
+    """Map MGRS tile id to a stable 0-based region index (UTM zone-1)."""
+    prefix = tile_id.split("_")[0]
+    m = _MGRS_PREFIX_RE.match(prefix)
+    if not m:
+        return 0
+    zone = int(m.group(1))
+    if not 1 <= zone <= 60:
+        return 0
+    return zone - 1
+
+
 class DeforestationPatchDataset(Dataset):
     """Random-crop patches from cached tile .npz files.
 
@@ -967,12 +981,9 @@ class DeforestationPatchDataset(Dataset):
         return out
 
     def __getitem__(self, idx: int):
-        path = self.cache_paths[idx//self.patches_per_tile]
-        tile_id = path.stem.split("_")[0]
-        zone_str = tile_id[:2]
-
-        region_label = ZONE_MAPPING.get(zone_str, 0)
-
+        tile_idx = idx // self.patches_per_tile if self.is_train else idx
+        tile_id = self.cache_paths[tile_idx].stem
+        region_label = tile_id_to_region_label(tile_id)
 
         t = self._load(idx)
         x = stack_features(t, self.feature_keys)
@@ -997,8 +1008,8 @@ class DeforestationPatchDataset(Dataset):
             "w":         torch.from_numpy(np.ascontiguousarray(conf)).float(),
             "mask":      torch.from_numpy(np.ascontiguousarray(mask)).float(),
             "forest_gt": torch.from_numpy(np.ascontiguousarray(forest_gt)).long(),
-            "tile":      self.cache_paths[idx // self.patches_per_tile if self.is_train else idx].stem,
-            "region_label": region_label, 
+            "tile":      self.cache_paths[tile_idx].stem,
+            "region_label": torch.tensor(region_label, dtype=torch.long),
         }
 
 
