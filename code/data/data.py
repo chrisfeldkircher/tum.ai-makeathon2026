@@ -921,7 +921,7 @@ def cache_tile(ti: TileInventory, cache_dir: Path, **kwargs) -> Path:
 
 # Channel counts annotated per group so the total (274) stays easy to audit
 # when tuning the Tier-2 U-Net input stem.
-DEFAULT_FEATURE_KEYS: tuple[str, ...] = (
+CORE_FEATURE_KEYS: tuple[str, ...] = (
     "aef_pre", "aef_post", "aef_delta",                               # 3*64 = 192
     "s2_pre_band_median", "s2_post_band_median",                      # 2*12 =  24
     "s2_pre_band_std",    "s2_post_band_std",                         # 2*12 =  24
@@ -944,6 +944,14 @@ DEFAULT_FEATURE_KEYS: tuple[str, ...] = (
     "forest_mask_2020",                                               #         1
 )
 
+PROB_FEATURE_KEYS: tuple[str, ...] = (
+    "forest_prob_pre",
+    "forest_prob_post",
+    "forest_prob_delta",
+)
+
+DEFAULT_FEATURE_KEYS: tuple[str, ...] = CORE_FEATURE_KEYS + PROB_FEATURE_KEYS
+
 
 # Feature layout for DANN_Temporal_UNet. The model expects the per-month
 # channels up front (so its TemporalChannelAttention can reshape to a
@@ -955,6 +963,38 @@ TEMPORAL_FEATURE_KEYS: tuple[str, ...] = (
     "s1_monthly_pre_desc",   # 12 months × VV (descending)=  12
     "aef_delta",             # 64 AEF embedding dims      =  64
 )
+
+REQUIRED_TRAIN_CACHE_KEYS: tuple[str, ...] = (
+    *CORE_FEATURE_KEYS,
+    "label",
+    "label_confidence",
+    "forest_gt_pre2020",
+)
+
+
+def _needs_prob_sidecar(feature_keys: Iterable[str]) -> bool:
+    return any(k in PROB_FEATURE_KEYS for k in feature_keys)
+
+
+def cache_missing_keys(cache_path: Path | str,
+                       required_keys: Iterable[str]) -> list[str]:
+    cache_path = Path(cache_path)
+    with np.load(cache_path, allow_pickle=False) as npz:
+        available = set(npz.files)
+    return [k for k in required_keys if k not in available]
+
+
+def load_probability_sidecar(tile_id: str, probs_dir: Path | str = "./cache_probs") -> dict[str, np.ndarray]:
+    probs_dir = Path(probs_dir)
+    sidecar_path = probs_dir / f"{tile_id}.npz"
+    if not sidecar_path.exists():
+        raise FileNotFoundError(
+            f"Missing probability sidecar for tile {tile_id}: {sidecar_path.resolve()}\n"
+            "Run `python code/reports/p2_post_period.py --cache_dir ./cache --out_dir ./cache_probs` "
+            "or pass a different `probs_dir`."
+        )
+    with np.load(sidecar_path, allow_pickle=False) as npz:
+        return {k: npz[k] for k in npz.files}
 
 
 def stack_features(tensors: dict[str, np.ndarray],
@@ -970,23 +1010,9 @@ def stack_features(tensors: dict[str, np.ndarray],
 
 _MGRS_PREFIX_RE = re.compile(r"^(\d{2})([A-Z])[A-Z]{2}$")
 
-# DANN "region" = continent bucket derived from the UTM zone number. The hidden
-# test is on Africa, and training has 0 African tiles (SA: 18/19N, SE Asia:
-# 47/48Q+P). Using continent as the domain label means the adversary has a
-# clean 2-class problem (SA vs SE Asia) at training time, while the logit
-# head keeps slots open for Africa and Other so inference on a novel
-# continent produces a well-formed output (uniform prior, no key mismatch).
-#
-# Bucket definition: UTM zone is a longitudinal band (6° wide each), so a
-# zone-number bin approximates continent. Zones 1–22 cover the Americas
-# (South America uses 17–22), 23–37 cover Europe/Africa (equatorial Africa
-# is 29–37), 38–57 cover Asia (SE Asia is 45–52).
-#
-# Labels (used as the class index for nn.CrossEntropyLoss on domain_logits):
-#   0 : Americas / South America
-#   1 : Europe / Africa
-#   2 : Asia
-#   3 : Other / Oceania (zones 58–60 + fallback)
+# DANN "region" = continent bucket derived from the UTM zone number. The
+# baseline path doesn't use this directly, but keeping the mapping aligned with
+# the latest downstream branch avoids reintroducing the older zone-id labeling.
 REGION_AMERICAS = 0
 REGION_AFRICA   = 1
 REGION_ASIA     = 2
@@ -995,13 +1021,7 @@ NUM_REGIONS     = 4
 
 
 def tile_id_to_region_label(tile_id: str) -> int:
-    """Map MGRS tile id → 0-based region index keyed on *continent bucket*.
-
-    Returns one of REGION_AMERICAS / REGION_AFRICA / REGION_ASIA /
-    REGION_OTHER. Invalid prefixes fall back to REGION_OTHER rather than
-    silently merging with Americas (the old behavior), which would have
-    biased the domain classifier.
-    """
+    """Map MGRS tile id to a stable 0-based continent-bucket index."""
     prefix = tile_id.split("_")[0]
     m = _MGRS_PREFIX_RE.match(prefix)
     if not m:
@@ -1032,6 +1052,7 @@ class DeforestationPatchDataset(Dataset):
         self,
         cache_paths: list[Path],
         feature_keys: tuple[str, ...] = DEFAULT_FEATURE_KEYS,
+        probs_dir: Path | str = "./cache_probs",
         patch_size: int = 256,
         patches_per_tile: int = 8,
         positive_ratio: float = 0.5,
@@ -1042,6 +1063,7 @@ class DeforestationPatchDataset(Dataset):
             raise RuntimeError("PyTorch is required for DeforestationPatchDataset")
         self.cache_paths = list(cache_paths)
         self.feature_keys = feature_keys
+        self.probs_dir = Path(probs_dir)
         self.patch_size = patch_size
         self.patches_per_tile = patches_per_tile
         self.positive_ratio = positive_ratio
@@ -1056,7 +1078,10 @@ class DeforestationPatchDataset(Dataset):
     def _load(self, idx: int) -> dict[str, np.ndarray]:
         tile_idx = idx // self.patches_per_tile if self.is_train else idx
         with np.load(self.cache_paths[tile_idx], allow_pickle=False) as npz:
-            return {k: npz[k] for k in npz.files}
+            tensors = {k: npz[k] for k in npz.files}
+        if _needs_prob_sidecar(self.feature_keys):
+            tensors.update(load_probability_sidecar(self.cache_paths[tile_idx].stem, self.probs_dir))
+        return tensors
 
     def _sample_crop(self, label: np.ndarray, forest: np.ndarray) -> tuple[int, int]:
         H, W = label.shape
@@ -1180,6 +1205,7 @@ def split_tiles(tile_ids: list[str], val_frac: float = 0.15, seed: int = 0
 def build_dataloaders(
     root: Path | str,
     cache_dir: Path | str = "./cache",
+    probs_dir: Path | str = "./cache_probs",
     batch_size: int = 8,
     patch_size: int = 256,
     patches_per_tile: int = 8,
@@ -1218,7 +1244,17 @@ def build_dataloaders(
         if not ti.has_any_labels():
             skipped_no_labels.append(tile_id); continue
         try:
-            cache_paths[tile_id] = cache_tile(ti, cache_dir, **preprocess_kwargs)
+            cache_path = cache_tile(ti, cache_dir, **preprocess_kwargs)
+            missing = cache_missing_keys(cache_path, REQUIRED_TRAIN_CACHE_KEYS)
+            if missing:
+                logger.info(
+                    "Regenerating stale cache for %s; missing keys: %s",
+                    tile_id,
+                    ", ".join(missing[:6]) + ("..." if len(missing) > 6 else ""),
+                )
+                cache_path.unlink(missing_ok=True)
+                cache_path = cache_tile(ti, cache_dir, **preprocess_kwargs)
+            cache_paths[tile_id] = cache_path
         except Exception as e:
             logger.warning(f"Failed to preprocess {tile_id}: {e}")
 
@@ -1247,10 +1283,11 @@ def build_dataloaders(
 
     train_ds = DeforestationPatchDataset(
         [cache_paths[t] for t in train_ids],
+        probs_dir=probs_dir,
         patch_size=patch_size, patches_per_tile=patches_per_tile, is_train=True, seed=seed,
     )
     val_ds = DeforestationPatchDataset(
-        [cache_paths[t] for t in val_ids], is_train=False, seed=seed,
+        [cache_paths[t] for t in val_ids], probs_dir=probs_dir, is_train=False, seed=seed,
     )
 
     train_loader = DataLoader(
