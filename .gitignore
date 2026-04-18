@@ -60,3 +60,5 @@ logs/
 wandb/
 mlruns/
 lightning_logs/
+data
+.claude

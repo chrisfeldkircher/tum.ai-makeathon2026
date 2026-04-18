@@ -9,3 +9,7 @@ botocore  # Version defined by boto3, but explicitly imported
 tqdm~=4.66
 ipykernel
 jupyter
+scipy~=1.13.0
+scikit-learn~=1.5.0
+lightgbm~=4.1.0
+torch~=2.3.0
