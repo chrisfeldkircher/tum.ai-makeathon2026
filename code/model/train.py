@@ -260,6 +260,59 @@ def _current_lr(optimizer: torch.optim.Optimizer) -> float:
     return float(optimizer.param_groups[0]["lr"])
 
 
+def _infer_output_stride(model: nn.Module) -> int:
+    """Best-effort extraction of encoder output stride (defaults to 32)."""
+    if isinstance(model, DeforestationBaseModel):
+        base = model.model
+    elif isinstance(model, DANN_UNet):
+        base = model.unet
+    else:
+        base = model
+
+    stride = getattr(getattr(base, "encoder", None), "output_stride", 32)
+    try:
+        stride = int(stride)
+    except (TypeError, ValueError):
+        stride = 32
+    return max(1, stride)
+
+
+def _pad_to_stride(x: torch.Tensor, stride: int) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Pad right/bottom so H and W are divisible by stride."""
+    h, w = int(x.shape[-2]), int(x.shape[-1])
+    pad_h = (stride - (h % stride)) % stride
+    pad_w = (stride - (w % stride)) % stride
+    if pad_h == 0 and pad_w == 0:
+        return x, (h, w)
+    x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+    return x, (h, w)
+
+
+def _crop_logits(logits: torch.Tensor, original_hw: tuple[int, int]) -> torch.Tensor:
+    h, w = original_hw
+    if int(logits.shape[-2]) == h and int(logits.shape[-1]) == w:
+        return logits
+    return logits[..., :h, :w]
+
+
+def _forward_with_stride_padding(
+    model: nn.Module,
+    x: torch.Tensor,
+    use_domain_adaptation: bool = False,
+    grl_lambda: float = 1.0,
+) -> Dict[str, torch.Tensor]:
+    stride = _infer_output_stride(model)
+    x_pad, original_hw = _pad_to_stride(x, stride)
+
+    if use_domain_adaptation:
+        out = model(x_pad, grl_lambda=grl_lambda)
+    else:
+        out = model(x_pad)
+
+    out["seg_logits"] = _crop_logits(out["seg_logits"], original_hw)
+    return out
+
+
 def train_one_epoch_baseline(
     model: nn.Module,
     loader,
@@ -298,7 +351,7 @@ def train_one_epoch_baseline(
 
         if amp_scaler is not None:
             with torch.cuda.amp.autocast():
-                out = model(x)
+                out = _forward_with_stride_padding(model, x, use_domain_adaptation=False)
                 seg_loss = weighted_bce_dice_loss(out["seg_logits"], y, w)
             if not torch.isfinite(seg_loss):
                 raise RuntimeError("Non-finite segmentation loss encountered in baseline training.")
@@ -308,7 +361,7 @@ def train_one_epoch_baseline(
             amp_scaler.step(optimizer)
             amp_scaler.update()
         else:
-            out = model(x)
+            out = _forward_with_stride_padding(model, x, use_domain_adaptation=False)
             seg_loss = weighted_bce_dice_loss(out["seg_logits"], y, w)
             if not torch.isfinite(seg_loss):
                 raise RuntimeError("Non-finite segmentation loss encountered in baseline training.")
@@ -407,7 +460,12 @@ def train_one_epoch_dann(
 
         if amp_scaler is not None:
             with torch.cuda.amp.autocast():
-                out = model(x, grl_lambda=grl_lambda)
+                out = _forward_with_stride_padding(
+                    model,
+                    x,
+                    use_domain_adaptation=True,
+                    grl_lambda=grl_lambda,
+                )
                 seg_loss = weighted_bce_dice_loss(out["seg_logits"], y, w)
                 dom_loss = domain_criterion(out["domain_logits"], region_label)
                 total_loss = seg_loss + alpha * dom_loss
@@ -420,7 +478,12 @@ def train_one_epoch_dann(
             amp_scaler.step(optimizer)
             amp_scaler.update()
         else:
-            out = model(x, grl_lambda=grl_lambda)
+            out = _forward_with_stride_padding(
+                model,
+                x,
+                use_domain_adaptation=True,
+                grl_lambda=grl_lambda,
+            )
             seg_loss = weighted_bce_dice_loss(out["seg_logits"], y, w)
             dom_loss = domain_criterion(out["domain_logits"], region_label)
             total_loss = seg_loss + alpha * dom_loss
@@ -503,7 +566,12 @@ def validate_one_epoch(
         yb = y.unsqueeze(1).float() if y.ndim == 3 else y.float()
 
         if use_domain_adaptation:
-            out = model(x, grl_lambda=1.0)
+            out = _forward_with_stride_padding(
+                model,
+                x,
+                use_domain_adaptation=True,
+                grl_lambda=1.0,
+            )
             seg_loss = weighted_bce_dice_loss(out["seg_logits"], y, w)
             if "region_label" in batch:
                 region_label = batch["region_label"].to(device, non_blocking=True).long()
@@ -517,7 +585,7 @@ def validate_one_epoch(
             running_dom += float(dom_loss.item())
             running_dom_acc += dom_acc
         else:
-            out = model(x)
+            out = _forward_with_stride_padding(model, x, use_domain_adaptation=False)
             seg_loss = weighted_bce_dice_loss(out["seg_logits"], y, w)
             total_loss = seg_loss
 
