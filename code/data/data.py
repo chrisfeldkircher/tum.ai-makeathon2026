@@ -29,9 +29,11 @@ Folder layout expected (relative to `root`):
 
 from __future__ import annotations
 
+import os
 import logging
 import re
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
@@ -908,15 +910,141 @@ def preprocess_tile(
 
 
 def cache_tile(ti: TileInventory, cache_dir: Path, **kwargs) -> Path:
-    """Run `preprocess_tile` and dump to `.npz`. Returns the cache file path."""
+    """Run `preprocess_tile` and dump to `.npz`. Returns the cache file path.
+
+    Extra kwargs handled here:
+      - include_ndvi_drop: bool (default False)
+      - ndvi_persistence_window: int (default 3)
+      - overwrite: bool (default False)
+    Remaining kwargs are forwarded to `preprocess_tile`.
+    """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"{ti.tile_id}.npz"
-    if cache_path.exists():
+
+    include_ndvi_drop = bool(kwargs.pop("include_ndvi_drop", False))
+    ndvi_persistence_window = int(kwargs.pop("ndvi_persistence_window", 3))
+    overwrite = bool(kwargs.pop("overwrite", False))
+
+    if cache_path.exists() and not overwrite:
+        if include_ndvi_drop:
+            missing = cache_missing_keys(
+                cache_path,
+                ("ndvi_drop_magnitude", "drop_doy", "drop_year", "drop_month_idx"),
+            )
+            if missing:
+                from model.ndviDropDetector import augment_cache_with_ndvi_drop
+
+                augment_cache_with_ndvi_drop(
+                    cache_path,
+                    ti,
+                    persistence_window=ndvi_persistence_window,
+                    overwrite=False,
+                )
         return cache_path
+
+    if cache_path.exists() and overwrite:
+        cache_path.unlink(missing_ok=True)
+
     tensors = preprocess_tile(ti, **kwargs)
+
+    if include_ndvi_drop:
+        from model.ndviDropDetector import compute_ndvi_drop
+
+        maps = compute_ndvi_drop(ti, ref=None, persistence_window=ndvi_persistence_window)
+        tensors["ndvi_drop_magnitude"] = maps.ndvi_drop_magnitude
+        tensors["drop_doy"] = maps.drop_doy
+        tensors["drop_year"] = maps.drop_year
+        tensors["drop_month_idx"] = maps.drop_month_idx
+
     np.savez_compressed(cache_path, **tensors)
     return cache_path
+
+
+def _cache_tile_worker(payload: tuple[TileInventory, str, dict]) -> tuple[str, str, str]:
+    """Worker entrypoint: returns (tile_id, split, status_or_error)."""
+    ti, cache_dir_str, kwargs = payload
+    try:
+        cache_tile(ti, Path(cache_dir_str), **kwargs)
+        return ti.tile_id, ti.split, "OK"
+    except RuntimeError as e:
+        return ti.tile_id, ti.split, f"SKIP — {e}"
+    except Exception as e:
+        return ti.tile_id, ti.split, f"ERROR — {e}"
+
+
+def build_cache(
+    inventory: dict[str, TileInventory],
+    cache_dir: Path | str,
+    preprocess_kwargs: dict | None = None,
+    include_ndvi_drop: bool = True,
+    ndvi_persistence_window: int = 3,
+    overwrite: bool = False,
+    max_workers: int | None = None,
+    verbose: bool = True,
+) -> tuple[list[Path], list[tuple[str, str]]]:
+    """Build caches for all tiles, optionally in parallel.
+
+    Returns:
+      - list of written cache paths
+      - list of (tile_id, error_text) for skipped/failed tiles
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    preprocess_kwargs = dict(preprocess_kwargs or {})
+
+    worker_kwargs = {
+        **preprocess_kwargs,
+        "include_ndvi_drop": include_ndvi_drop,
+        "ndvi_persistence_window": ndvi_persistence_window,
+        "overwrite": overwrite,
+    }
+
+    items = sorted(inventory.items())
+    if max_workers is None:
+        cpu = os.cpu_count() or 1
+        max_workers = max(1, min(8, cpu - 1))
+    if max_workers < 1:
+        max_workers = 1
+
+    skipped: list[tuple[str, str]] = []
+    written: list[Path] = []
+
+    if verbose:
+        logger.info(
+            "Building cache for %d tiles with workers=%d, ndvi_drop=%s, overwrite=%s",
+            len(items), max_workers, include_ndvi_drop, overwrite,
+        )
+
+    if max_workers == 1:
+        for tid, ti in items:
+            _, split, status = _cache_tile_worker((ti, str(cache_dir), worker_kwargs))
+            if status == "OK":
+                written.append(cache_dir / f"{tid}.npz")
+            else:
+                skipped.append((tid, status))
+            if verbose:
+                logger.info("  %s [%s] %s", tid, split, status)
+        return written, skipped
+
+    payloads = [(ti, str(cache_dir), worker_kwargs) for _, ti in items]
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_cache_tile_worker, p): p[0].tile_id for p in payloads}
+        done = 0
+        total = len(futures)
+        for fut in as_completed(futures):
+            tid, split, status = fut.result()
+            done += 1
+            if status == "OK":
+                written.append(cache_dir / f"{tid}.npz")
+            else:
+                skipped.append((tid, status))
+            if verbose:
+                logger.info("  [%d/%d] %s [%s] %s", done, total, tid, split, status)
+
+    written.sort()
+    skipped.sort(key=lambda x: x[0])
+    return written, skipped
 
 
 # Channel counts annotated per group so the total (274) stays easy to audit

@@ -30,6 +30,7 @@ try:
         dann_lambda_schedule,
         train_one_epoch_baseline,
         train_one_epoch_dann,
+        validate_one_epoch,
         train_one_epoch,
         fit,
     )
@@ -43,6 +44,7 @@ try:
         "dann_lambda_schedule",
         "train_one_epoch_baseline",
         "train_one_epoch_dann",
+        "validate_one_epoch",
         "train_one_epoch",
         "fit",
     ]

@@ -4,6 +4,7 @@ from .data import (
     build_inventory,
     preprocess_tile,
     cache_tile,
+    build_cache,
     stack_features,
     compute_indices,
     fuse_labels,
@@ -23,7 +24,7 @@ from .data import (
 
 __all__ = [
     "TileInventory", "ReferenceGrid",
-    "build_inventory", "preprocess_tile", "cache_tile", "stack_features",
+    "build_inventory", "preprocess_tile", "cache_tile", "build_cache", "stack_features",
     "compute_indices", "fuse_labels", "forest_mask_2020",
     "DeforestationPatchDataset", "build_dataloaders", "split_tiles",
     "tile_id_to_region_label",
