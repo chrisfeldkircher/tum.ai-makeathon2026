@@ -658,7 +658,7 @@ def stack_features(tensors: dict[str, np.ndarray],
         chans.append(a.astype(np.float32))
     return np.concatenate(chans, axis=0)
 
-
+ZONE_MAPPING = {zone: i for i, zone in enumerate(["18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29",])}
 class DeforestationPatchDataset(Dataset):
     """Random-crop patches from cached tile .npz files.
 
@@ -749,6 +749,13 @@ class DeforestationPatchDataset(Dataset):
         return out
 
     def __getitem__(self, idx: int):
+        path = self.cache_paths[idx//self.patches_per_tile]
+        tile_id = path.stem.split("_")[0]
+        zone_str = tile_id[:2]
+
+        region_label = ZONE_MAPPING.get(zone_str, 0)
+
+
         t = self._load(idx)
         x = stack_features(t, self.feature_keys)
         mask = t.get("forest_mask_2020", np.ones(x.shape[-2:], dtype=np.uint8))
@@ -771,10 +778,9 @@ class DeforestationPatchDataset(Dataset):
             "y":         torch.from_numpy(np.ascontiguousarray(label)).long(),
             "w":         torch.from_numpy(np.ascontiguousarray(conf)).float(),
             "mask":      torch.from_numpy(np.ascontiguousarray(mask)).float(),
-            # EVALUATION ONLY — do NOT use as a training input. This is the
-            # free forest ground-truth derived from post-2020 alert unions.
             "forest_gt": torch.from_numpy(np.ascontiguousarray(forest_gt)).long(),
             "tile":      self.cache_paths[idx // self.patches_per_tile if self.is_train else idx].stem,
+            "region_label": region_label, 
         }
 
 
