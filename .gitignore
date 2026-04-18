@@ -49,7 +49,6 @@ Thumbs.db
 
 # Model artefacts & local experiment output
 *.ckpt
-*.pt
 *.pth
 *.npz
 *.joblib
