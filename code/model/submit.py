@@ -14,6 +14,7 @@ A second step merges per-tile FeatureCollections into one submission .geojson.
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -22,8 +23,7 @@ from typing import Iterable, Optional
 import numpy as np
 import rasterio
 import torch
-from rasterio.crs import CRS
-from rasterio.transform import Affine
+import torch.nn as nn
 
 # The submission utility lives outside `code/`, add it to the path on import.
 _PROBLEM_DIR = Path(__file__).resolve().parents[2] / "problem"
@@ -32,6 +32,7 @@ if str(_PROBLEM_DIR) not in sys.path:
 from submission_utils import raster_to_geojson  # noqa: E402
 
 from data.data import (
+    DEFAULT_FEATURE_KEYS,
     ReferenceGrid,
     TEMPORAL_FEATURE_KEYS,
     TileInventory,
@@ -39,7 +40,29 @@ from data.data import (
     preprocess_tile,
     stack_features,
 )
-from model.dann_temporal_unet import DANN_Temporal_UNet, inference_pipeline
+from model.dann_temporal_unet import inference_pipeline
+
+
+class _GRLCompatAdapter(nn.Module):
+    """Wrap a non-DANN model so `inference_pipeline` can call it with grl_lambda."""
+
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor, grl_lambda: float = 0.0):
+        return self.model(x)
+
+
+def _maybe_wrap_for_inference(model: nn.Module) -> nn.Module:
+    """Wrap the model if its forward() doesn't accept grl_lambda."""
+    try:
+        sig = inspect.signature(model.forward)
+    except (TypeError, ValueError):
+        return model
+    if "grl_lambda" in sig.parameters:
+        return model
+    return _GRLCompatAdapter(model)
 
 
 def _write_binary_geotiff(pred: np.ndarray, ref: ReferenceGrid, out_path: Path) -> None:
@@ -56,17 +79,18 @@ def _write_binary_geotiff(pred: np.ndarray, ref: ReferenceGrid, out_path: Path) 
 
 
 def predict_tile(
-    model: DANN_Temporal_UNet,
+    model: nn.Module,
     ti: TileInventory,
     device: torch.device,
     patch_size: int = 256,
     overlap: int = 64,
     threshold: float = 0.5,
     use_forest_gate: bool = True,
+    feature_keys: tuple[str, ...] = TEMPORAL_FEATURE_KEYS,
 ) -> tuple[np.ndarray, ReferenceGrid]:
     """Run inference on one tile, returning (binary_pred_HW, reference_grid)."""
     tensors = preprocess_tile(ti)
-    stack = stack_features(tensors, feature_keys=TEMPORAL_FEATURE_KEYS)  # (232, H, W)
+    stack = stack_features(tensors, feature_keys=feature_keys)
     tile_tensor = torch.from_numpy(stack).float()
 
     forest_mask = None
@@ -74,15 +98,13 @@ def predict_tile(
         forest_mask = torch.from_numpy(tensors["forest_mask_2020"].astype(np.float32))
 
     out = inference_pipeline(
-        model, tile_tensor,
+        _maybe_wrap_for_inference(model), tile_tensor,
         forest_mask=forest_mask,
         patch_size=patch_size, overlap=overlap,
         threshold=threshold, device=device,
     )
     pred = out["pred_gated"].numpy() if use_forest_gate else out["pred"].numpy()
 
-    # Reconstruct the reference grid the same way preprocess_tile did so the
-    # GeoTIFF we write inherits the correct CRS/transform.
     ref_source = max(ti.s2_paths.values(), key=lambda p: _scene_pixels(p))
     ref = ReferenceGrid.from_s2(ref_source)
     return pred, ref
@@ -94,7 +116,7 @@ def _scene_pixels(path: Path) -> int:
 
 
 def build_submission(
-    model: DANN_Temporal_UNet,
+    model: nn.Module,
     data_root: Path | str,
     out_dir: Path | str,
     split: str = "test",
@@ -102,6 +124,7 @@ def build_submission(
     threshold: float = 0.5,
     min_area_ha: float = 0.5,
     tile_ids: Optional[Iterable[str]] = None,
+    feature_keys: tuple[str, ...] = TEMPORAL_FEATURE_KEYS,
 ) -> Path:
     """Run inference on every tile in `split` and write one merged submission.geojson.
 
@@ -124,7 +147,10 @@ def build_submission(
 
     for tid, ti in sorted(inventory.items()):
         try:
-            pred, ref = predict_tile(model, ti, device=device, threshold=threshold)
+            pred, ref = predict_tile(
+                model, ti, device=device, threshold=threshold,
+                feature_keys=feature_keys,
+            )
             if pred.sum() == 0:
                 print(f"  {tid}: no positive pixels — skipping")
                 continue
