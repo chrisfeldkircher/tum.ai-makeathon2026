@@ -1,0 +1,153 @@
+# P0 Baseline Audit — data_stats.md
+
+**Tiles:** 10 · **Total pixels:** 10,145,868
+**forest_gt_pre2020 pixels:** 2,062,570  (20.329% of total)
+**label (deforestation) pixels:** 1,107,189  (10.913% of total)
+
+## Tile shape distribution
+- Tiles range from 1002×1002 to 1020×1020 pixels with minor variations; most are ~1006×1006.
+
+## MGRS-zone distribution
+Data spans three distinct MGRS zones in the Amazon region:
+- **18N** (4 tiles; N. Brazil/French Guiana): High forest density (avg. 20.5% forest_gt) and deforestation activity (avg. 12.5% label). Zones WG, WH, XH, XJ show dense vegetation with high confidence labels.
+- **48P** (4 tiles; Western Amazon): Mixed forest coverage (avg. 22.1% forest_gt), ranging from sparse savanna-like regions (48PUT_0_8: 7.3%) to dense forest (48PWV_7_8: 45.9%). Higher AEF-zero pixels suggest noisier satellite observations.
+- **48Q** (2 tiles; Central Amazon): Moderate forest coverage (17.7% forest_gt) with lower deforestation rates (~7%), indicating more stable forest regions.
+
+## Per-tile summary
+Column definitions: **tile_id** – unique tile identifier | **zone** – MGRS zone | **H×W** – tile resolution | **forest_gt%** – pre-2020 ground truth forest coverage | **label%** – labeled deforestation pixels | **conf(mean)** – mean confidence of deforestation labels (0–1) | **forest_mask_2020%** – forest coverage by static 2020 mask | **aef_zero_group%** – percentage of AEF pixels with all-zero embeddings (data quality flag).
+
+| tile_id | zone | H×W | forest_gt% | label% | conf(mean) | forest_mask_2020% | aef_zero_group% |
+|---------|------|-----|------------|--------|------------|-------------------|-----------------|
+| `18NWG_6_6` | 18N | 1002×1002 | 36.85% | 25.07% | 0.761 | 79.66% | 0.399% |
+| `18NWH_1_4` | 18N | 1002×1002 | 3.51% | 1.21% | 0.525 | 78.73% | 0.399% |
+| `18NXH_6_8` | 18N | 1002×1002 | 36.66% | 22.60% | 0.684 | 98.21% | 0.399% |
+| `18NXJ_7_6` | 18N | 1004×1004 | 2.98% | 1.14% | 0.522 | 68.42% | 0.795% |
+| `48PUT_0_8` | 48P | 1012×1006 | 7.31% | 1.80% | 0.518 | 48.48% | 1.775% |
+| `48PWV_7_8` | 48P | 1006×1006 | 45.90% | 25.03% | 0.684 | 79.98% | 1.189% |
+| `48PXC_7_7` | 48P | 1016×1016 | 14.46% | 6.82% | 0.639 | 67.12% | 3.124% |
+| `48PYB_3_6` | 48P | 1020×1020 | 20.55% | 11.47% | 0.701 | 77.06% | 3.883% |
+| `48QVE_3_0` | 48Q | 1008×1008 | 17.86% | 7.07% | 0.591 | 56.45% | 1.581% |
+| `48QWD_2_2` | 48Q | 1004×1003 | 17.46% | 7.13% | 0.599 | 54.32% | 0.695% |
+
+## Representative tile — per-key inspection
+
+| key | present | shape | dtype | nan% | min | mean | max |
+|-----|---------|-------|-------|------|-----|------|-----|
+| `aef_pre` | ✓ | (64, 1006, 1006) | float32 | 0.00% | -0.4562 | -0.0033 | 0.5157 |
+| `aef_post` | ✓ | (64, 1006, 1006) | float32 | 0.00% | -0.4678 | 5.446e-04 | 0.5071 |
+| `aef_delta` | ✓ | (64, 1006, 1006) | float32 | 0.00% | -0.3951 | 0.0038 | 0.3474 |
+| `s2_pre_ndvi_median` | ✓ | (1006, 1006) | float32 | 0.00% | 0.0000 | 0.7084 | 0.8830 |
+| `s2_pre_ndvi_std` | ✓ | (1006, 1006) | float32 | 0.00% | 0.0000 | 0.1477 | 0.3605 |
+| `s2_pre_nbr_median` | ✓ | (1006, 1006) | float32 | 0.00% | -1.0000 | 0.4725 | 0.7129 |
+| `s2_pre_nbr_std` | ✓ | (1006, 1006) | float32 | 0.00% | 0.0000 | 0.1285 | 0.4163 |
+| `s2_pre_band_median` | ✓ | (12, 1006, 1006) | float32 | 0.00% | 0.0000 | 0.1678 | 0.5035 |
+| `s2_post_band_median` | ✓ | (12, 1006, 1006) | float32 | 0.00% | 0.0000 | 0.1782 | 0.4608 |
+| `s1_pre_vv_median` | ✓ | (1006, 1006) | float32 | 0.00% | -12.9599 | -7.1302 | 0.0000 |
+| `s1_pre_vv_std` | ✓ | (1006, 1006) | float32 | 0.00% | 0.0000 | 1.3210 | 4.7839 |
+| `forest_mask_2020` | ✓ | (1006, 1006) | uint8 | 0.00% | 0.0000 | 0.7998 | 1.0000 |
+| `forest_gt_pre2020` | ✓ | (1006, 1006) | uint8 | 0.00% | 0.0000 | 0.4590 | 1.0000 |
+| `label` | ✓ | (1006, 1006) | uint8 | 0.00% | 0.0000 | 0.2503 | 1.0000 |
+| `label_confidence` | ✓ | (1006, 1006) | float32 | 0.00% | 0.0000 | 0.3111 | 1.0000 |
+
+## AEF dimension aggregate (across tiles)
+Columns: mean, std, min, max aggregated across tiles.
+
+| dim (1-based) | mean | std | min | max |
+|---|------|-----|-----|-----|
+| A01 | 0.0383 | 0.0410 | -0.2124 | 0.2989 |
+| A02 | 4.482e-04 | 0.0467 | -0.3130 | 0.3098 |
+| A03 | 0.0572 | 0.0457 | -0.1440 | 0.3178 |
+| A04 | -0.0789 | 0.0358 | -0.3369 | 0.1976 |
+| A05 | -0.0298 | 0.0287 | -0.2080 | 0.3262 |
+| A06 | -0.0398 | 0.0760 | -0.2770 | 0.3369 |
+| A07 | -0.0280 | 0.0548 | -0.3093 | 0.2520 |
+| A08 | 0.0583 | 0.0332 | -0.2215 | 0.3396 |
+| A09 | -0.0018 | 0.0364 | -0.2904 | 0.2558 |
+| A10 | 0.1302 | 0.0465 | -0.1699 | 0.3989 |
+| A11 | 0.0424 | 0.0402 | -0.3237 | 0.3781 |
+| A12 | 0.0629 | 0.0450 | -0.2002 | 0.2743 |
+| A13 | -0.1112 | 0.0341 | -0.4263 | 0.1004 |
+| A14 | -0.0163 | 0.0376 | -0.1923 | 0.1963 |
+| A15 | 0.0032 | 0.0375 | -0.2680 | 0.2365 |
+| A16 | -0.1230 | 0.0642 | -0.4136 | 0.1981 |
+| A17 | -0.0498 | 0.0367 | -0.2289 | 0.2759 |
+| A18  🌲 | 0.0058 | 0.0553 | -0.3402 | 0.3433 |
+| A19 | -0.0509 | 0.0319 | -0.3937 | 0.1381 |
+| A20 | -0.0444 | 0.0545 | -0.3735 | 0.2817 |
+| A21  🌲 | -0.0672 | 0.0743 | -0.4334 | 0.2209 |
+| A22 | 0.0223 | 0.0618 | -0.2977 | 0.3781 |
+| A23 | 0.1122 | 0.1238 | -0.4714 | 0.4136 |
+| A24 | 0.1387 | 0.0691 | -0.2520 | 0.4764 |
+| A25 | 0.0027 | 0.0418 | -0.3430 | 0.1852 |
+| A26  🌲 | 0.0286 | 0.0497 | -0.2594 | 0.3537 |
+| A27 | 0.1344 | 0.0499 | -0.1328 | 0.3553 |
+| A28  🌲 | -0.1052 | 0.0406 | -0.3294 | 0.1455 |
+| A29 | -0.1272 | 0.0539 | -0.4493 | 0.1647 |
+| A30 | 0.0074 | 0.0482 | -0.3434 | 0.3353 |
+| A31 | 0.1432 | 0.0725 | -0.2889 | 0.4312 |
+| A32 | -0.0677 | 0.0619 | -0.3982 | 0.3014 |
+| A33 | -0.0528 | 0.0534 | -0.3377 | 0.3223 |
+| A34  🌲 | 0.0126 | 0.0579 | -0.2206 | 0.3618 |
+| A35 | -0.0321 | 0.0351 | -0.3956 | 0.2191 |
+| A36 | 0.0153 | 0.0503 | -0.2639 | 0.3378 |
+| A37 | -0.0283 | 0.0446 | -0.3264 | 0.3014 |
+| A38 | -0.0711 | 0.0487 | -0.3814 | 0.2061 |
+| A39 | -0.0786 | 0.0590 | -0.3744 | 0.2638 |
+| A40 | -0.0533 | 0.0463 | -0.4238 | 0.3202 |
+| A41 | 0.0822 | 0.0379 | -0.2408 | 0.2900 |
+| A42 | 0.0172 | 0.0521 | -0.3179 | 0.2906 |
+| A43 | -0.0383 | 0.0331 | -0.3188 | 0.2670 |
+| A44 | 0.1336 | 0.0509 | -0.0628 | 0.5092 |
+| A45 | -0.0159 | 0.0551 | -0.4454 | 0.2129 |
+| A46 | -0.0342 | 0.0479 | -0.3242 | 0.3002 |
+| A47 | -0.0783 | 0.0443 | -0.3502 | 0.1589 |
+| A48 | 0.0086 | 0.0642 | -0.2638 | 0.5207 |
+| A49 | -0.0867 | 0.0428 | -0.3839 | 0.0676 |
+| A50 | -0.0108 | 0.0351 | -0.2991 | 0.2360 |
+| A51 | 0.1249 | 0.0624 | -0.1966 | 0.3226 |
+| A52 | -0.0687 | 0.0420 | -0.3682 | 0.2680 |
+| A53 | 0.0654 | 0.0396 | -0.1728 | 0.3071 |
+| A54 | 0.0442 | 0.0383 | -0.2494 | 0.3404 |
+| A55 | 0.0686 | 0.0479 | -0.1166 | 0.3722 |
+| A56 | 0.0955 | 0.0406 | -0.2215 | 0.3536 |
+| A57 | 0.0374 | 0.0346 | -0.2056 | 0.2227 |
+| A58 | -0.0382 | 0.0373 | -0.2761 | 0.1912 |
+| A59 | 0.0535 | 0.0513 | -0.2974 | 0.4002 |
+| A60 | -0.1237 | 0.0542 | -0.4442 | 0.1631 |
+| A61 | 0.0286 | 0.0476 | -0.2651 | 0.2983 |
+| A62 | -0.0892 | 0.0629 | -0.3924 | 0.2365 |
+| A63 | 0.0622 | 0.0488 | -0.3079 | 0.4238 |
+| A64 | 0.0128 | 0.0587 | -0.3712 | 0.2520 |
+
+🌲 = paper-identified tree-cover dims (A18, A21, A26 exclusive; A28, A34 shared).
+
+## Sanity checks
+
+ℹ️ **Test tiles (skipped, no ground truth):** 6 tiles
+  - `18NWJ_8_9`
+  - `18NWM_9_4`
+  - `18NYH_9_9`
+  - `19NBD_4_4`
+  - `47QMB_0_8`
+  - `47QQV_2_4`
+
+✓ All training tiles have required keys `s2_pre_ndvi_median`, `s2_pre_ndvi_std`, `s2_pre_nbr_median`, `aef_pre`, `forest_gt_pre2020`, `forest_mask_2020`
+⚠️ **AEF all-zero pixel groups > 0.1% in:**
+  - `18NWG_6_6`: 0.399%
+  - `18NWH_1_4`: 0.399%
+  - `18NXH_6_8`: 0.399%
+  - `18NXJ_7_6`: 0.795%
+  - `48PUT_0_8`: 1.775%
+  - `48PWV_7_8`: 1.189%
+  - `48PXC_7_7`: 3.124%
+  - `48PYB_3_6`: 3.883%
+  - `48QVE_3_0`: 1.581%
+  - `48QWD_2_2`: 0.695%
+✓ All tiles have non-empty forest_gt_pre2020.
+
+## Figures
+
+- `code/reports/figs/p0_overview_*.png` — 4-panel tile overview (S2 RGB / NDVI / GT / predicted mask)
+- `code/reports/figs/p0_gt_pixel_count.png` — GT pixel count per tile
+- `code/reports/figs/p0_aef_pca_*.png` — AEF_pre PCA coloured by forest_gt_pre2020
+- `code/reports/figs/p0_prob_hist_*.png` — masker probability histogram, split by GT
