@@ -8,6 +8,53 @@ from torch.autograd import Function
 
 import segmentation_models_pytorch as smp
 
+
+import torch
+import torch.nn as nn
+import segmentation_models_pytorch as smp
+
+class DeforestationBaseModel(nn.Module):
+    """
+    Base prediction model for Deforestation Detection.
+    Switches between U-Net and DeepLabV3+ to produce pixel-wise logits.
+    """
+    def __init__(
+        self, 
+        architecture: str = "deeplabv3plus", 
+        encoder_name: str = "resnet34", 
+        in_channels: int = 251
+    ):
+        super().__init__()
+        self.architecture = architecture.lower()
+        
+        # 251 channels means we cannot use standard ImageNet pretrained weights.
+        # We must initialize with random weights (None) for the encoder.
+        encoder_weights = None 
+        
+        if self.architecture == "deeplabv3plus":
+            self.model = smp.DeepLabV3Plus(
+                encoder_name=encoder_name,
+                encoder_weights=encoder_weights,
+                in_channels=in_channels,
+                classes=1,            # 1 for binary segmentation (Deforested or Not)
+                activation=None       # Outputs raw logits
+            )
+        elif self.architecture == "unet":
+            self.model = smp.Unet(
+                encoder_name=encoder_name,
+                encoder_weights=encoder_weights,
+                in_channels=in_channels,
+                classes=1,
+                activation=None
+            )
+        else:
+            raise ValueError(f"Architecture '{architecture}' is not supported. Use 'unet' or 'deeplabv3plus'.")
+
+    def forward(self, x):
+        # Takes (B, 251, H, W) and outputs (B, 1, H, W)
+        seg_logits = self.model(x)
+        return {"seg_logits": seg_logits}
+    
 class RobustLoss(nn.Module):
     """
     Combines Weighted BCE + Dice for segmentation and 
