@@ -120,21 +120,31 @@ _LEARNED_FEATURE_KEYS: tuple[str, ...] = (
     "s1_pre_vv_median",   "s1_pre_vv_std",
 )
 
+# AlphaEarth paper-identified tree-cover dims (1-based → 0-based indices).
+# Table 2: A18/A21/A26 tree-cover specialists. Table 3: A28 shared grassland↔tree,
+# A34 shared shrub↔tree. P3 error analysis confirmed strong FN/TP separation on
+# these dims (up to 3.22σ on worst tile).
+_AEF_TREE_DIMS: tuple[int, ...] = (17, 20, 25, 27, 33)
+
 
 def _per_pixel_features(tensors: dict[str, np.ndarray],
                         keys: Iterable[str] = _LEARNED_FEATURE_KEYS,
-                        include_aef: bool = True) -> np.ndarray:
+                        include_aef: bool = True,
+                        include_aef_tree_dims: bool = True) -> np.ndarray:
     """Build a (N_pixels, n_features) matrix from a cached tile dict."""
     feats = []
     for k in keys:
         if k in tensors:
             feats.append(tensors[k].reshape(-1))
-    if include_aef and "aef_pre" in tensors:
+    if "aef_pre" in tensors:
         aef = tensors["aef_pre"]
-        # Use channel-wise mean/std as a cheap summary of the 64-dim AEF stack
-        # — feeding all 64 channels explodes the training-pixel matrix.
-        feats.append(aef.mean(axis=0).reshape(-1))
-        feats.append(aef.std(axis=0).reshape(-1))
+        if include_aef:
+            # Channel-wise mean/std: cheap summary of the 64-dim AEF stack.
+            feats.append(aef.mean(axis=0).reshape(-1))
+            feats.append(aef.std(axis=0).reshape(-1))
+        if include_aef_tree_dims:
+            for d in _AEF_TREE_DIMS:
+                feats.append(aef[d].reshape(-1))
     return np.stack(feats, axis=1).astype(np.float32)
 
 
@@ -184,6 +194,7 @@ class LearnedForestMasker:
 
     feature_keys: tuple[str, ...] = field(default_factory=lambda: _LEARNED_FEATURE_KEYS)
     include_aef: bool = True
+    include_aef_tree_dims: bool = True
 
     model: object | None = None
 
@@ -202,7 +213,7 @@ class LearnedForestMasker:
         seasonal   = (~pos) & (ndvi_std > 0.15) & (ndvi < 0.55)
         neg = stable_low | seasonal
 
-        feats = _per_pixel_features(tensors, self.feature_keys, self.include_aef)
+        feats = _per_pixel_features(tensors, self.feature_keys, self.include_aef, self.include_aef_tree_dims)
         pos_flat = pos.reshape(-1); neg_flat = neg.reshape(-1)
 
         pos_idx = np.where(pos_flat)[0]
@@ -271,7 +282,7 @@ class LearnedForestMasker:
     def predict_proba(self, tensors: dict[str, np.ndarray]) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Call .fit(...) before .predict_proba(...).")
-        feats = _per_pixel_features(tensors, self.feature_keys, self.include_aef)
+        feats = _per_pixel_features(tensors, self.feature_keys, self.include_aef, self.include_aef_tree_dims)
         feats = np.clip(feats, -1e3, 1e3)
         proba = self.model.predict_proba(feats)[:, 1]
         H, W = tensors["s2_pre_ndvi_median"].shape

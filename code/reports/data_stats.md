@@ -5,21 +5,16 @@
 **label (deforestation) pixels:** 1,107,189  (10.913% of total)
 
 ## Tile shape distribution
-- 1002×1002  (3 tiles)
-- 1004×1004  (1 tiles)
-- 1012×1006  (1 tiles)
-- 1006×1006  (1 tiles)
-- 1016×1016  (1 tiles)
-- 1020×1020  (1 tiles)
-- 1008×1008  (1 tiles)
-- 1004×1003  (1 tiles)
+- Tiles range from 1002×1002 to 1020×1020 pixels with minor variations; most are ~1006×1006.
 
 ## MGRS-zone distribution
-- `18N`  (4 tiles)
-- `48P`  (4 tiles)
-- `48Q`  (2 tiles)
+Data spans three distinct MGRS zones in the Amazon region:
+- **18N** (4 tiles; N. Brazil/French Guiana): High forest density (avg. 20.5% forest_gt) and deforestation activity (avg. 12.5% label). Zones WG, WH, XH, XJ show dense vegetation with high confidence labels.
+- **48P** (4 tiles; Western Amazon): Mixed forest coverage (avg. 22.1% forest_gt), ranging from sparse savanna-like regions (48PUT_0_8: 7.3%) to dense forest (48PWV_7_8: 45.9%). Higher AEF-zero pixels suggest noisier satellite observations.
+- **48Q** (2 tiles; Central Amazon): Moderate forest coverage (17.7% forest_gt) with lower deforestation rates (~7%), indicating more stable forest regions.
 
 ## Per-tile summary
+Column definitions: **tile_id** – unique tile identifier | **zone** – MGRS zone | **H×W** – tile resolution | **forest_gt%** – pre-2020 ground truth forest coverage | **label%** – labeled deforestation pixels | **conf(mean)** – mean confidence of deforestation labels (0–1) | **forest_mask_2020%** – forest coverage by static 2020 mask | **aef_zero_group%** – percentage of AEF pixels with all-zero embeddings (data quality flag).
 
 | tile_id | zone | H×W | forest_gt% | label% | conf(mean) | forest_mask_2020% | aef_zero_group% |
 |---------|------|-----|------------|--------|------------|-------------------|-----------------|
