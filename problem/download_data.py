@@ -5,6 +5,8 @@ from pathlib import Path
 
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
+from botocore import UNSIGNED
+from botocore.config import Config
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -18,7 +20,7 @@ def download_s3_folder(bucket_name: str, folder_name: str, local_dir: str = "./d
         folder_name (str): The folder inside the S3 bucket to download.
         local_dir (str): The local directory where the bucket contents will be saved.
     """
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
     prefix = folder_name.strip("/")
     if prefix:
         prefix = f"{prefix}/"

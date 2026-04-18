@@ -1,0 +1,62 @@
+# Raw challenge data (downloaded via `make download_data_from_s3`)
+data/
+!code/data/
+cache/
+cache.zip
+content/
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+.tox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+.python-version
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Model artefacts & local experiment output
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.joblib
+*.pkl
+*.h5
+*.onnx
+runs/
+outputs/
+logs/
+*.log
+wandb/
+mlruns/
+lightning_logs/
