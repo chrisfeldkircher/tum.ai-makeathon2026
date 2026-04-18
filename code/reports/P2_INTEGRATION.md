@@ -16,7 +16,7 @@ Three new per-tile float32 rasters — `forest_prob_pre`, `forest_prob_post`, `f
 
 | channel | shape | dtype | range | meaning |
 |---------|-------|-------|-------|---------|
-| `forest_prob_pre`   | `(H, W)` | `float32` | `[0, 1]` | P(forest) from the **pre-period** masker (current `LearnedForestMasker.predict_proba` config on the merged downstream pipeline; includes trajectory/neighborhood/orbit features plus explicit AEF tree dims A18/21/26/28/34). |
+| `forest_prob_pre`   | `(H, W)` | `float32` | `[0, 1]` | P(forest) from the **pre-period** masker (same model as `LearnedForestMasker.predict_proba` — P1-shipped config, tree dims A18/21/26/28/34 included). |
 | `forest_prob_post`  | `(H, W)` | `float32` | `[0, 1]` | P(forest) from an analogous masker trained on **post-period** features (`s2_post_*`, `s1_post_*`, `aef_post`). Positives = "truly still forest" = `forest_gt_pre2020 == 1 AND label == 0`. |
 | `forest_prob_delta` | `(H, W)` | `float32` | `[-1, 1]` | `forest_prob_pre - forest_prob_post`. **Positive delta ≈ lost forest-like appearance between pre and post period** — the primary deforestation signal of this artifact. |
 
@@ -41,7 +41,7 @@ prob_delta = probs["forest_prob_delta"]   # (H, W) float32 in [-1,1]
 
 ### 2) Add to your existing feature stack (training + inference, same way)
 
-If your deforestation model consumes a `(C, H, W)` feature tensor assembled from the main cache, simply stack these three channels on. On the latest downstream baseline this means `274 -> 277` channels:
+If your deforestation model consumes a `(C, H, W)` feature tensor assembled from the main cache, simply stack these three channels on:
 
 ```python
 extra = np.stack([prob_pre, prob_post, prob_delta], axis=0)   # (3, H, W)
