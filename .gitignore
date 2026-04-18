@@ -4,6 +4,7 @@ data/
 cache/
 cache.zip
 content/
+maestro/
 
 # Python bytecode & caches
 __pycache__/
