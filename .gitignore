@@ -61,4 +61,5 @@ wandb/
 mlruns/
 lightning_logs/
 data
-.claude
+.claude/
+cache_probs/

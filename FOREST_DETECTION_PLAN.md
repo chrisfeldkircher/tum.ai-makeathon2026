@@ -138,6 +138,11 @@ Given that:
   - **Worst tile 48PUT_0_8: 0.9343 → 0.9422** (+0.8%), **18NWH_1_4: 0.9431 → 0.9675** (+2.4%)
   - No regressions beyond noise (worst delta −0.0001). Min tile-recall improved 0.9343 → 0.9422.
   - Report: `code/reports/P1_AEF_DIMS.md`
+- `2026-04-18 18:40` — **P2 SHIPPED.** Post-period masker trained with still-forest positives (`forest_gt_pre2020 & label==0`).
+  - 3 new per-tile rasters cached in `cache_probs/<tile_id>.npz`: `forest_prob_pre`, `forest_prob_post`, `forest_prob_delta`
+  - Sanity: deforested pixels show mean delta +0.151 vs +0.058 for stable pixels (3× ratio, 0.43σ separation). Weak-but-real signal — use as soft feature, not hard classifier.
+  - Handoff doc: `code/reports/P2_INTEGRATION.md` — load + stack-as-features instructions for deforestation team.
+  - Script: `code/reports/p2_post_period.py` (deterministic, ~3 min on 16 tiles).
 - `2026-04-18 18:10` — Re-prioritisation after reviewing P3 + P1 results:
   - **Biggest remaining signal: edges** (7–9× FN rate vs core, every tile). Not touched by P1.
   - **Second: NDVI [0.4,0.5) still at 81% aggregate miss** — P1 helped, not eliminated.
