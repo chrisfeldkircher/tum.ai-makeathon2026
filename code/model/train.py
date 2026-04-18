@@ -1,17 +1,11 @@
 import math
-from typing import Dict, Tuple, Optional
+from typing import Any, Dict, Optional, Tuple
 
+import segmentation_models_pytorch as smp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
-
-import segmentation_models_pytorch as smp
-
-
-import torch
-import torch.nn as nn
-import segmentation_models_pytorch as smp
 
 class DeforestationBaseModel(nn.Module):
     """
@@ -19,25 +13,25 @@ class DeforestationBaseModel(nn.Module):
     Switches between U-Net and DeepLabV3+ to produce pixel-wise logits.
     """
     def __init__(
-        self, 
-        architecture: str = "deeplabv3plus", 
-        encoder_name: str = "resnet34", 
-        in_channels: int = 251
+        self,
+        architecture: str = "deeplabv3plus",
+        encoder_name: str = "resnet34",
+        in_channels: int = 251,
     ):
         super().__init__()
         self.architecture = architecture.lower()
-        
+
         # 251 channels means we cannot use standard ImageNet pretrained weights.
         # We must initialize with random weights (None) for the encoder.
-        encoder_weights = None 
-        
+        encoder_weights = None
+
         if self.architecture == "deeplabv3plus":
             self.model = smp.DeepLabV3Plus(
                 encoder_name=encoder_name,
                 encoder_weights=encoder_weights,
                 in_channels=in_channels,
-                classes=1,            # 1 for binary segmentation (Deforested or Not)
-                activation=None       # Outputs raw logits
+                classes=1,
+                activation=None,
             )
         elif self.architecture == "unet":
             self.model = smp.Unet(
@@ -45,46 +39,16 @@ class DeforestationBaseModel(nn.Module):
                 encoder_weights=encoder_weights,
                 in_channels=in_channels,
                 classes=1,
-                activation=None
+                activation=None,
             )
         else:
             raise ValueError(f"Architecture '{architecture}' is not supported. Use 'unet' or 'deeplabv3plus'.")
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         # Takes (B, 251, H, W) and outputs (B, 1, H, W)
         seg_logits = self.model(x)
         return {"seg_logits": seg_logits}
-    
-class RobustLoss(nn.Module):
-    """
-    Combines Weighted BCE + Dice for segmentation and 
-    CrossEntropy for domain adaptation.
-    """
-    def __init__(self, domain_weight: float = 0.1):
-        super().__init__()
-        self.domain_weight = domain_weight
-        self.seg_criterion = smp.losses.DiceLoss(smp.losses.BINARY_MODE, from_logits=True)
-        self.dom_criterion = nn.CrossEntropyLoss()
 
-    def forward(self, out: Dict[str, torch.Tensor], y: torch.Tensor, 
-                w: torch.Tensor, region_labels: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        # 1. Segmentation Loss (Weighted by label confidence 'w')
-        # BCE part handled manually to use per-pixel weights
-        bce = F.binary_cross_entropy_with_logits(out["seg_logits"], y, weight=w)
-        dice = self.seg_criterion(out["seg_logits"], y)
-        seg_loss = bce + dice
-
-        # 2. Domain Loss (from the GRL branch)
-        dom_loss = self.dom_criterion(out["domain_logits"], region_labels)
-
-        total_loss = seg_loss + (self.domain_weight * dom_loss)
-        
-        return total_loss, {
-            "seg_loss": seg_loss.item(),
-            "dom_loss": dom_loss.item(),
-            "total": total_loss.item()
-        }
-    
 
 class _GRLFunction(Function):
     @staticmethod
@@ -144,8 +108,8 @@ class DANN_UNet(nn.Module):
 
     def forward(self, x: torch.Tensor, grl_lambda: float = 1.0) -> Dict[str, torch.Tensor]:
         # Encoder-decoder forward for segmentation
-        features = self.unet.encoder(x)                     # list of feature maps
-        decoder_out = self.unet.decoder(features)       # highest-res decoder feature
+        features = self.unet.encoder(x)
+        decoder_out = self.unet.decoder(*features)
         seg_logits = self.unet.segmentation_head(decoder_out)  # [B,1,H,W]
 
         # Domain branch from bottleneck
@@ -159,6 +123,34 @@ class DANN_UNet(nn.Module):
             "seg_logits": seg_logits,
             "domain_logits": domain_logits,
         }
+
+
+def build_model(
+    model_type: str,
+    in_channels: int = 251,
+    encoder_name: str = "resnet34",
+    architecture: str = "deeplabv3plus",
+    num_regions: Optional[int] = None,
+    domain_dropout: float = 0.3,
+) -> nn.Module:
+    """Factory for baseline and DANN models."""
+    mt = model_type.lower()
+    if mt in {"baseline", "seg", "segmentation"}:
+        return DeforestationBaseModel(
+            architecture=architecture,
+            encoder_name=encoder_name,
+            in_channels=in_channels,
+        )
+    if mt in {"dann", "generalization", "domain_adaptation"}:
+        if num_regions is None:
+            raise ValueError("num_regions is required when model_type='dann'.")
+        return DANN_UNet(
+            num_regions=num_regions,
+            in_channels=in_channels,
+            encoder_name=encoder_name,
+            domain_dropout=domain_dropout,
+        )
+    raise ValueError("model_type must be one of: baseline, dann")
 
 
 def random_spectral_scaling(
@@ -191,12 +183,8 @@ def random_spectral_scaling(
     s2_lo, s2_hi = s2_slice
     s1_lo, s1_hi = s1_slice
 
-    x_aug[:, s2_lo:s2_hi] = torch.where(
-        apply, x_aug[:, s2_lo:s2_hi] * s2_scale, x_aug[:, s2_lo:s2_hi]
-    )
-    x_aug[:, s1_lo:s1_hi] = torch.where(
-        apply, x_aug[:, s1_lo:s1_hi] * s1_scale, x_aug[:, s1_lo:s1_hi]
-    )
+    x_aug[:, s2_lo:s2_hi] = torch.where(apply, x_aug[:, s2_lo:s2_hi] * s2_scale, x_aug[:, s2_lo:s2_hi])
+    x_aug[:, s1_lo:s1_hi] = torch.where(apply, x_aug[:, s1_lo:s1_hi] * s1_scale, x_aug[:, s1_lo:s1_hi])
 
     return x_aug
 
@@ -241,7 +229,72 @@ def dann_lambda_schedule(progress_0_to_1: float) -> float:
     return 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0
 
 
-def train_one_epoch(
+def _prepare_batch(batch: Dict[str, Any], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    x = batch["x"].to(device, non_blocking=True).float()
+    y = batch["y"].to(device, non_blocking=True)
+    w = batch["w"].to(device, non_blocking=True).float()
+
+    if "mask" in batch:
+        m = batch["mask"].to(device, non_blocking=True).float()
+        w = w * m
+
+    return x, y, w
+
+
+def train_one_epoch_baseline(
+    model: nn.Module,
+    loader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    amp_scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    spectral_aug_p: float = 0.5,
+    s2_slice: Tuple[int, int] = (0, 144),
+    s1_slice: Tuple[int, int] = (144, 168),
+) -> Dict[str, float]:
+    """Train one epoch for the baseline segmentation model."""
+    model.train()
+
+    running_total = 0.0
+    n_batches = 0
+
+    for batch in loader:
+        x, y, w = _prepare_batch(batch, device)
+        x = random_spectral_scaling(
+            x,
+            s2_slice=s2_slice,
+            s1_slice=s1_slice,
+            scale_min=0.8,
+            scale_max=1.2,
+            p=spectral_aug_p,
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+
+        if amp_scaler is not None:
+            with torch.cuda.amp.autocast():
+                out = model(x)
+                seg_loss = weighted_bce_dice_loss(out["seg_logits"], y, w)
+            amp_scaler.scale(seg_loss).backward()
+            amp_scaler.step(optimizer)
+            amp_scaler.update()
+        else:
+            out = model(x)
+            seg_loss = weighted_bce_dice_loss(out["seg_logits"], y, w)
+            seg_loss.backward()
+            optimizer.step()
+
+        running_total += float(seg_loss.detach().item())
+        n_batches += 1
+
+    denom = max(1, n_batches)
+    return {
+        "loss_total": running_total / denom,
+        "loss_seg": running_total / denom,
+        "loss_domain": 0.0,
+    }
+
+
+def train_one_epoch_dann(
     model: DANN_UNet,
     loader,
     optimizer: torch.optim.Optimizer,
@@ -254,16 +307,7 @@ def train_one_epoch(
     s2_slice: Tuple[int, int] = (0, 144),
     s1_slice: Tuple[int, int] = (144, 168),
 ) -> Dict[str, float]:
-    """
-    Expects each batch to contain:
-      - batch['x']: [B,251,H,W]
-      - batch['y']: [B,H,W] binary mask
-      - batch['w']: [B,H,W] pixel weights
-      - batch['region_label']: [B] integer region IDs
-      - optional batch['mask']: [B,H,W] forest mask for gating
-
-    Loss_total = Segmentation_Loss(weighted_BCE_Dice) + alpha * Domain_Loss(CrossEntropy)
-    """
+    """Train one epoch for DANN (segmentation + domain adversarial)."""
     model.train()
     domain_criterion = nn.CrossEntropyLoss()
 
@@ -275,21 +319,11 @@ def train_one_epoch(
     total_steps = max(1, len(loader))
 
     for step, batch in enumerate(loader):
-        x = batch["x"].to(device, non_blocking=True).float()
-        y = batch["y"].to(device, non_blocking=True)
-        w = batch["w"].to(device, non_blocking=True).float()
+        x, y, w = _prepare_batch(batch, device)
+        if "region_label" not in batch:
+            raise KeyError("DANN training requires batch['region_label'].")
         region_label = batch["region_label"].to(device, non_blocking=True).long()
 
-        # Optional forest gating in addition to confidence weights
-
-        if model.training:
-            x = random_spectral_scaling(x)
-            
-        if "mask" in batch:
-            m = batch["mask"].to(device, non_blocking=True).float()
-            w = w * m
-
-        # Spectral augmentation (S2 + S1 channel groups)
         x = random_spectral_scaling(
             x,
             s2_slice=s2_slice,
@@ -299,10 +333,9 @@ def train_one_epoch(
             p=spectral_aug_p,
         )
 
-        # DANN lambda schedule based on global training progress
         global_step = epoch * total_steps + step
         max_steps = max(1, num_epochs * total_steps - 1)
-        progress = (epoch * len(loader) + step) / (num_epochs * len(loader))
+        progress = global_step / max_steps
         grl_lambda = dann_lambda_schedule(progress)
 
         optimizer.zero_grad(set_to_none=True)
@@ -337,3 +370,106 @@ def train_one_epoch(
         "loss_seg": running_seg / denom,
         "loss_domain": running_dom / denom,
     }
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    num_epochs: int,
+    alpha: float = 0.1,
+    amp_scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    spectral_aug_p: float = 0.5,
+    s2_slice: Tuple[int, int] = (0, 144),
+    s1_slice: Tuple[int, int] = (144, 168),
+    use_domain_adaptation: Optional[bool] = None,
+) -> Dict[str, float]:
+    """
+    Unified one-epoch trainer.
+    - Baseline mode: segmentation only.
+    - DANN mode: segmentation + alpha * domain CE loss.
+    """
+    if use_domain_adaptation is None:
+        use_domain_adaptation = isinstance(model, DANN_UNet)
+
+    if use_domain_adaptation:
+        if not isinstance(model, DANN_UNet):
+            raise TypeError("use_domain_adaptation=True requires model to be an instance of DANN_UNet.")
+        return train_one_epoch_dann(
+            model=model,
+            loader=loader,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            num_epochs=num_epochs,
+            alpha=alpha,
+            amp_scaler=amp_scaler,
+            spectral_aug_p=spectral_aug_p,
+            s2_slice=s2_slice,
+            s1_slice=s1_slice,
+        )
+
+    return train_one_epoch_baseline(
+        model=model,
+        loader=loader,
+        optimizer=optimizer,
+        device=device,
+        amp_scaler=amp_scaler,
+        spectral_aug_p=spectral_aug_p,
+        s2_slice=s2_slice,
+        s1_slice=s1_slice,
+    )
+
+
+def fit(
+    model: nn.Module,
+    train_loader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    num_epochs: int,
+    alpha: float = 0.1,
+    amp_scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    spectral_aug_p: float = 0.5,
+    s2_slice: Tuple[int, int] = (0, 144),
+    s1_slice: Tuple[int, int] = (144, 168),
+    use_domain_adaptation: Optional[bool] = None,
+    scheduler: Optional[Any] = None,
+) -> list[Dict[str, float]]:
+    """Train for multiple epochs and return per-epoch loss history."""
+    history: list[Dict[str, float]] = []
+    for epoch in range(num_epochs):
+        stats = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            num_epochs=num_epochs,
+            alpha=alpha,
+            amp_scaler=amp_scaler,
+            spectral_aug_p=spectral_aug_p,
+            s2_slice=s2_slice,
+            s1_slice=s1_slice,
+            use_domain_adaptation=use_domain_adaptation,
+        )
+        history.append(stats)
+        if scheduler is not None:
+            scheduler.step()
+    return history
+
+
+__all__ = [
+    "GradientReversal",
+    "DeforestationBaseModel",
+    "DANN_UNet",
+    "build_model",
+    "random_spectral_scaling",
+    "weighted_bce_dice_loss",
+    "dann_lambda_schedule",
+    "train_one_epoch_baseline",
+    "train_one_epoch_dann",
+    "train_one_epoch",
+    "fit",
+]
