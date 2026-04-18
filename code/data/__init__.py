@@ -10,6 +10,7 @@ from .data import (
     build_forest_ground_truth,
     forest_mask_2020,
     DeforestationPatchDataset,
+    tile_id_to_region_label,
     build_dataloaders,
     split_tiles,
     DEFAULT_FEATURE_KEYS,
@@ -22,5 +23,6 @@ __all__ = [
     "build_inventory", "preprocess_tile", "cache_tile", "stack_features",
     "compute_indices", "fuse_labels", "forest_mask_2020",
     "DeforestationPatchDataset", "build_dataloaders", "split_tiles",
+    "tile_id_to_region_label",
     "DEFAULT_FEATURE_KEYS", "DEFAULT_PRE_YEARS", "DEFAULT_POST_YEARS",
 ]

@@ -1,8 +1,9 @@
 """
-model.py — Robust Multi-Task Deforestation Detection
-======================================================
-DANN_Temporal_UNet  : Full architecture with temporal attention, AEF bottleneck
-                      fusion, and gradient-reversal domain adaptation.
+dann_temporal_unet.py — Robust Multi-Task Deforestation Detection
+=================================================================
+DANN_Temporal_UNet  : Temporal attention + U-Net + AEF bottleneck fusion +
+                      gradient-reversal domain adaptation. Input layout is
+                      defined by `data.TEMPORAL_FEATURE_KEYS` (232 channels).
 inference_pipeline  : Full-tile sliding-window prediction with forest gating.
 """
 
@@ -111,7 +112,7 @@ class AEFFusion(nn.Module):
 
 
 class DomainClassifier(nn.Module):
-    def __init__(self, in_features: int = 512, num_regions: int = 10, dropout: float = 0.3):
+    def __init__(self, in_features: int = 512, num_regions: int = 4, dropout: float = 0.3):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_features, 512),
@@ -126,13 +127,25 @@ class DomainClassifier(nn.Module):
 
 # --- 4. The Full Network ---
 class DANN_Temporal_UNet(nn.Module):
+    """Temporal DANN U-Net matching `data.TEMPORAL_FEATURE_KEYS` layout.
+
+    Expected channel order (232 total):
+        [  0, 144)  s2_monthly_pre      — 12 months × 12 S2 bands
+        [144, 156)  s1_monthly_pre_asc  — 12 months VV ascending
+        [156, 168)  s1_monthly_pre_desc — 12 months VV descending
+        [168, 232)  aef_delta           — 64 AEF embedding dims
+
+    S1 is fed to the temporal block as (B, 12 months, 2 orbits, H, W); we
+    reshape from the flat [asc×12, desc×12] layout inside `forward`. No
+    "static" block — the original 60-ch slot was undocumented and no key in
+    the pipeline produces it, so it's dropped.
+    """
     def __init__(
         self,
-        num_regions: int = 10,
+        num_regions: int = 4,
         s2_monthly_slice: Tuple[int, int] = (0, 144),
         s1_monthly_slice: Tuple[int, int] = (144, 168),
-        aef_delta_slice: Tuple[int, int] = (228, 251),
-        static_slice: Tuple[int, int] = (168, 228),
+        aef_delta_slice: Tuple[int, int] = (168, 232),
         encoder_name: str = "resnet34",
         temporal_mode: str = "attention",
         s2_out_ch: int = 32,
@@ -145,15 +158,13 @@ class DANN_Temporal_UNet(nn.Module):
         self.s2_monthly_slice = s2_monthly_slice
         self.s1_monthly_slice = s1_monthly_slice
         self.aef_delta_slice = aef_delta_slice
-        self.static_slice = static_slice
 
         TemporalBlock = TemporalChannelAttention if temporal_mode == "attention" else TemporalMaxPool
 
         self.s2_temporal = TemporalBlock(n_timesteps=12, channels_per_t=12, out_channels=s2_out_ch)
         self.s1_temporal = TemporalBlock(n_timesteps=12, channels_per_t=2, out_channels=s1_out_ch)
 
-        static_ch = static_slice[1] - static_slice[0]
-        unet_in_ch = s2_out_ch + s1_out_ch + static_ch
+        unet_in_ch = s2_out_ch + s1_out_ch
 
         self.unet = smp.Unet(
             encoder_name=encoder_name,
@@ -175,12 +186,17 @@ class DANN_Temporal_UNet(nn.Module):
         s2_raw = x[:, self.s2_monthly_slice[0]:self.s2_monthly_slice[1]]
         s1_raw = x[:, self.s1_monthly_slice[0]:self.s1_monthly_slice[1]]
         aef_delta = x[:, self.aef_delta_slice[0]:self.aef_delta_slice[1]]
-        static = x[:, self.static_slice[0]:self.static_slice[1]]
+
+        # S1 arrives as [asc_m1..asc_m12, desc_m1..desc_m12]. The temporal
+        # block wants (B, T=12 months, C=2 orbits) grouping, so reshape as
+        # (B, 2, 12, H, W) and permute month and orbit axes.
+        B, _, H, W = s1_raw.shape
+        s1_raw = s1_raw.view(B, 2, 12, H, W).permute(0, 2, 1, 3, 4).reshape(B, 24, H, W)
 
         s2_feat = self.s2_temporal(s2_raw)
         s1_feat = self.s1_temporal(s1_raw)
 
-        unet_in = torch.cat([s2_feat, s1_feat, static], dim=1)
+        unet_in = torch.cat([s2_feat, s1_feat], dim=1)
         features = self.unet.encoder(unet_in)
         bottleneck = features[-1]
 
@@ -188,7 +204,7 @@ class DANN_Temporal_UNet(nn.Module):
         features = list(features)
         features[-1] = bottleneck
 
-        decoder_out = self.unet.decoder(*features)
+        decoder_out = self.unet.decoder(features)
         seg_logits = self.unet.segmentation_head(decoder_out)
 
         pooled = F.adaptive_avg_pool2d(bottleneck, 1).flatten(1)
