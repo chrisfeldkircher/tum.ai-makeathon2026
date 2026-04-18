@@ -389,7 +389,12 @@ def _pixel_slope(stk_ma: np.ndarray) -> np.ndarray:
     y_dev = np.where(valid, y_filled - y_mean[None], 0.0)
     num = (t_dev * y_dev).sum(axis=0)
     den = (t_dev * t_dev).sum(axis=0)
-    slope = np.where(den > 1e-6, num / den, 0.0)
+    slope = np.divide(
+        num,
+        den,
+        out=np.zeros_like(num, dtype=np.float32),
+        where=den > 1e-6,
+    )
     slope = np.where(n >= 3, slope, 0.0)
     return np.nan_to_num(slope, nan=0.0).astype(np.float32)
 
@@ -404,7 +409,12 @@ def _neighborhood_mean(a: np.ndarray, size: int) -> np.ndarray:
     a_f = np.where(valid, a, 0.0).astype(np.float32)
     num = ndi_uniform(a_f, size, mode="reflect")
     den = ndi_uniform(valid.astype(np.float32), size, mode="reflect")
-    return np.where(den > 0.0, num / den, 0.0).astype(np.float32)
+    return np.divide(
+        num,
+        den,
+        out=np.zeros_like(num, dtype=np.float32),
+        where=den > 0.0,
+    ).astype(np.float32)
 
 
 def lee_filter(img: np.ndarray, size: int = 5) -> np.ndarray:
@@ -620,7 +630,13 @@ def fuse_labels(ti: TileInventory, ref: ReferenceGrid,
         contrib  += hit.astype(np.uint8)
 
     consensus = (votes >= 2).astype(np.uint8)
-    mean_conf = np.where(contrib > 0, conf_sum / np.maximum(contrib, 1), 0.0).astype(np.float32)
+    contrib_f = contrib.astype(np.float32)
+    mean_conf = np.divide(
+        conf_sum,
+        contrib_f,
+        out=np.zeros_like(conf_sum, dtype=np.float32),
+        where=contrib_f > 0.0,
+    ).astype(np.float32)
     # Single-source pixels are ambiguous — keep a trickle of weight (0.3×) so
     # the loss can still learn from them but treats them as low-confidence.
     mean_conf = np.where(consensus == 1, mean_conf,
