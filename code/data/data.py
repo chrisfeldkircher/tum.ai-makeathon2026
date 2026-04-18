@@ -618,6 +618,10 @@ def preprocess_tile(
         out["forest_gt_pre2020"] = build_forest_ground_truth(ti, ref)
 
     out["_shape"] = np.array([ref.height, ref.width], dtype=np.int32)
+    # Geo-referencing: saved so the submission export step can reconstruct a
+    # GeoTIFF (needed by raster_to_geojson in problem/submission_utils.py).
+    out["_crs_wkt"]   = np.bytes_(ref.crs.to_wkt())
+    out["_transform"] = np.array(ref.transform[:6], dtype=np.float64)  # (a,b,c,d,e,f)
     return out
 
 
