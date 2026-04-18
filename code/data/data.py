@@ -968,19 +968,52 @@ def stack_features(tensors: dict[str, np.ndarray],
         chans.append(a.astype(np.float32))
     return np.concatenate(chans, axis=0)
 
-_MGRS_PREFIX_RE = re.compile(r"^(\d{2})[A-Z]{3}$")
+_MGRS_PREFIX_RE = re.compile(r"^(\d{2})([A-Z])[A-Z]{2}$")
+
+# DANN "region" = continent bucket derived from the UTM zone number. The hidden
+# test is on Africa, and training has 0 African tiles (SA: 18/19N, SE Asia:
+# 47/48Q+P). Using continent as the domain label means the adversary has a
+# clean 2-class problem (SA vs SE Asia) at training time, while the logit
+# head keeps slots open for Africa and Other so inference on a novel
+# continent produces a well-formed output (uniform prior, no key mismatch).
+#
+# Bucket definition: UTM zone is a longitudinal band (6° wide each), so a
+# zone-number bin approximates continent. Zones 1–22 cover the Americas
+# (South America uses 17–22), 23–37 cover Europe/Africa (equatorial Africa
+# is 29–37), 38–57 cover Asia (SE Asia is 45–52).
+#
+# Labels (used as the class index for nn.CrossEntropyLoss on domain_logits):
+#   0 : Americas / South America
+#   1 : Europe / Africa
+#   2 : Asia
+#   3 : Other / Oceania (zones 58–60 + fallback)
+REGION_AMERICAS = 0
+REGION_AFRICA   = 1
+REGION_ASIA     = 2
+REGION_OTHER    = 3
+NUM_REGIONS     = 4
 
 
 def tile_id_to_region_label(tile_id: str) -> int:
-    """Map MGRS tile id to a stable 0-based region index (UTM zone-1)."""
+    """Map MGRS tile id → 0-based region index keyed on *continent bucket*.
+
+    Returns one of REGION_AMERICAS / REGION_AFRICA / REGION_ASIA /
+    REGION_OTHER. Invalid prefixes fall back to REGION_OTHER rather than
+    silently merging with Americas (the old behavior), which would have
+    biased the domain classifier.
+    """
     prefix = tile_id.split("_")[0]
     m = _MGRS_PREFIX_RE.match(prefix)
     if not m:
-        return 0
+        return REGION_OTHER
     zone = int(m.group(1))
-    if not 1 <= zone <= 60:
-        return 0
-    return zone - 1
+    if 1 <= zone <= 22:
+        return REGION_AMERICAS
+    if 23 <= zone <= 37:
+        return REGION_AFRICA
+    if 38 <= zone <= 57:
+        return REGION_ASIA
+    return REGION_OTHER
 
 
 class DeforestationPatchDataset(Dataset):

@@ -112,7 +112,7 @@ class AEFFusion(nn.Module):
 
 
 class DomainClassifier(nn.Module):
-    def __init__(self, in_features: int = 512, num_regions: int = 10, dropout: float = 0.3):
+    def __init__(self, in_features: int = 512, num_regions: int = 4, dropout: float = 0.3):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_features, 512),
@@ -142,7 +142,7 @@ class DANN_Temporal_UNet(nn.Module):
     """
     def __init__(
         self,
-        num_regions: int = 12,
+        num_regions: int = 4,
         s2_monthly_slice: Tuple[int, int] = (0, 144),
         s1_monthly_slice: Tuple[int, int] = (144, 168),
         aef_delta_slice: Tuple[int, int] = (168, 232),
