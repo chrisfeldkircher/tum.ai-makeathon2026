@@ -134,10 +134,16 @@ _LEARNED_FEATURE_KEYS: tuple[str, ...] = (
     "s1_pre_vv_orbit_diff",
 )
 
+# AlphaEarth paper-identified tree-cover dims (1-based → 0-based indices).
+# Keep the full 64-dim downstream AEF signal, but also surface the strongest
+# tree-cover dims explicitly so the booster can weight them directly.
+_AEF_TREE_DIMS: tuple[int, ...] = (17, 20, 25, 27, 33)
+
 
 def _per_pixel_features(tensors: dict[str, np.ndarray],
                         keys: Iterable[str] = _LEARNED_FEATURE_KEYS,
-                        include_aef: bool = True) -> np.ndarray:
+                        include_aef: bool = True,
+                        include_aef_tree_dims: bool = True) -> np.ndarray:
     """Build a (N_pixels, n_features) matrix from a cached tile dict."""
     feats = []
     for k in keys:
@@ -148,6 +154,8 @@ def _per_pixel_features(tensors: dict[str, np.ndarray],
         # (arxiv 2603.16911); let the tree model pick which — don't pre-collapse.
         aef = tensors["aef_pre"]  # (64, H, W)
         feats.extend(aef[i].reshape(-1) for i in range(aef.shape[0]))
+        if include_aef_tree_dims:
+            feats.extend(aef[i].reshape(-1) for i in _AEF_TREE_DIMS)
     return np.stack(feats, axis=1).astype(np.float32)
 
 
@@ -197,6 +205,7 @@ class LearnedForestMasker:
 
     feature_keys: tuple[str, ...] = field(default_factory=lambda: _LEARNED_FEATURE_KEYS)
     include_aef: bool = True
+    include_aef_tree_dims: bool = True
 
     model: object | None = None
 
@@ -215,7 +224,12 @@ class LearnedForestMasker:
         seasonal   = (~pos) & (ndvi_std > 0.15) & (ndvi < 0.55)
         neg = stable_low | seasonal
 
-        feats = _per_pixel_features(tensors, self.feature_keys, self.include_aef)
+        feats = _per_pixel_features(
+            tensors,
+            self.feature_keys,
+            self.include_aef,
+            self.include_aef_tree_dims,
+        )
         pos_flat = pos.reshape(-1); neg_flat = neg.reshape(-1)
 
         pos_idx = np.where(pos_flat)[0]
@@ -284,7 +298,12 @@ class LearnedForestMasker:
     def predict_proba(self, tensors: dict[str, np.ndarray]) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Call .fit(...) before .predict_proba(...).")
-        feats = _per_pixel_features(tensors, self.feature_keys, self.include_aef)
+        feats = _per_pixel_features(
+            tensors,
+            self.feature_keys,
+            self.include_aef,
+            self.include_aef_tree_dims,
+        )
         feats = np.clip(feats, -1e3, 1e3)
         proba = self.model.predict_proba(feats)[:, 1]
         H, W = tensors["s2_pre_ndvi_median"].shape

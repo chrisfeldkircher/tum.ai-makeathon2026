@@ -13,6 +13,9 @@ from .data import (
     tile_id_to_region_label,
     build_dataloaders,
     split_tiles,
+    load_probability_sidecar,
+    CORE_FEATURE_KEYS,
+    PROB_FEATURE_KEYS,
     DEFAULT_FEATURE_KEYS,
     DEFAULT_PRE_YEARS,
     DEFAULT_POST_YEARS,
@@ -24,5 +27,7 @@ __all__ = [
     "compute_indices", "fuse_labels", "forest_mask_2020",
     "DeforestationPatchDataset", "build_dataloaders", "split_tiles",
     "tile_id_to_region_label",
+    "load_probability_sidecar",
+    "CORE_FEATURE_KEYS", "PROB_FEATURE_KEYS",
     "DEFAULT_FEATURE_KEYS", "DEFAULT_PRE_YEARS", "DEFAULT_POST_YEARS",
 ]
