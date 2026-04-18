@@ -6,4 +6,6 @@ Wrote 16 per-tile files to `cache_probs/`.
 
 **`delta > 0.3` as deforestation indicator:** precision=0.254, recall=0.204.
 
+Detailed distribution statistics and verification plots are in `P2_STATS.md`.
+
 See `P2_INTEGRATION.md` for handoff instructions.
