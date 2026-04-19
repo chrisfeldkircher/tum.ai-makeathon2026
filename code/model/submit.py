@@ -50,6 +50,9 @@ def _needs_prob_sidecar(feature_keys: Iterable[str]) -> bool:
     return any(k in PROB_FEATURE_KEYS for k in feature_keys)
 
 
+DEFAULT_FOREST_GATE_THRESHOLD = 0.30  # matches LearnedForestMasker.tier_non_forest_max
+
+
 class _GRLCompatAdapter(nn.Module):
     """Wrap a non-DANN model so `inference_pipeline` can call it with grl_lambda."""
 
@@ -117,6 +120,65 @@ def _load_tile_tensors(
     return tensors
 
 
+def predict_tile_prob(
+    model: nn.Module,
+    ti: TileInventory,
+    device: torch.device,
+    patch_size: int = 256,
+    overlap: int = 64,
+    feature_keys: tuple[str, ...] = TEMPORAL_FEATURE_KEYS,
+    cache_dir: Optional[Path] = None,
+    probs_dir: Optional[Path] = None,
+    forest_gate_threshold: float = DEFAULT_FOREST_GATE_THRESHOLD,
+) -> tuple[np.ndarray, Optional[np.ndarray], ReferenceGrid]:
+    """Run model inference once; return (prob_HW, forest_mask_HW_or_None, ref).
+
+    Split out from `predict_tile` so threshold / gate / min_area sweeps can reuse
+    the same expensive forward pass.
+    """
+    tensors = _load_tile_tensors(ti, feature_keys, cache_dir, probs_dir)
+    if probs_dir is not None and "forest_prob_pre" not in tensors:
+        try:
+            tensors.update(load_probability_sidecar(ti.tile_id, probs_dir))
+        except FileNotFoundError:
+            pass
+    stack = stack_features(tensors, feature_keys=feature_keys)
+    tile_tensor = torch.from_numpy(stack).float()
+
+    forest_mask_np: Optional[np.ndarray] = None
+    forest_mask_t: Optional[torch.Tensor] = None
+    if "forest_prob_pre" in tensors:
+        forest_mask_np = (tensors["forest_prob_pre"] >= forest_gate_threshold).astype(np.float32)
+        forest_mask_t = torch.from_numpy(forest_mask_np)
+    elif "forest_mask_2020" in tensors:
+        forest_mask_np = tensors["forest_mask_2020"].astype(np.float32)
+        forest_mask_t = torch.from_numpy(forest_mask_np)
+
+    out = inference_pipeline(
+        _maybe_wrap_for_inference(model), tile_tensor,
+        forest_mask=forest_mask_t,
+        patch_size=patch_size, overlap=overlap,
+        threshold=0.5, device=device,
+    )
+    prob = out["prob"].numpy()
+
+    ref_source = max(ti.s2_paths.values(), key=lambda p: _scene_pixels(p))
+    ref = ReferenceGrid.from_s2(ref_source)
+    return prob, forest_mask_np, ref
+
+
+def _threshold_and_gate(
+    prob: np.ndarray,
+    forest_mask: Optional[np.ndarray],
+    threshold: float,
+    use_forest_gate: bool,
+) -> np.ndarray:
+    pred = (prob >= threshold).astype(np.uint8)
+    if use_forest_gate and forest_mask is not None:
+        pred = pred * (forest_mask > 0.5).astype(np.uint8)
+    return pred
+
+
 def predict_tile(
     model: nn.Module,
     ti: TileInventory,
@@ -128,32 +190,46 @@ def predict_tile(
     feature_keys: tuple[str, ...] = TEMPORAL_FEATURE_KEYS,
     cache_dir: Optional[Path] = None,
     probs_dir: Optional[Path] = None,
+    forest_gate_threshold: float = DEFAULT_FOREST_GATE_THRESHOLD,
 ) -> tuple[np.ndarray, ReferenceGrid]:
     """Run inference on one tile, returning (binary_pred_HW, reference_grid)."""
-    tensors = _load_tile_tensors(ti, feature_keys, cache_dir, probs_dir)
-    stack = stack_features(tensors, feature_keys=feature_keys)
-    tile_tensor = torch.from_numpy(stack).float()
-
-    forest_mask = None
-    if use_forest_gate and "forest_mask_2020" in tensors:
-        forest_mask = torch.from_numpy(tensors["forest_mask_2020"].astype(np.float32))
-
-    out = inference_pipeline(
-        _maybe_wrap_for_inference(model), tile_tensor,
-        forest_mask=forest_mask,
+    prob, forest_mask, ref = predict_tile_prob(
+        model, ti, device,
         patch_size=patch_size, overlap=overlap,
-        threshold=threshold, device=device,
+        feature_keys=feature_keys,
+        cache_dir=cache_dir, probs_dir=probs_dir,
+        forest_gate_threshold=forest_gate_threshold,
     )
-    pred = out["pred_gated"].numpy() if use_forest_gate else out["pred"].numpy()
-
-    ref_source = max(ti.s2_paths.values(), key=lambda p: _scene_pixels(p))
-    ref = ReferenceGrid.from_s2(ref_source)
+    pred = _threshold_and_gate(prob, forest_mask, threshold, use_forest_gate)
     return pred, ref
 
 
 def _scene_pixels(path: Path) -> int:
     with rasterio.open(path) as src:
         return src.width * src.height
+
+
+def _polygonize_and_collect(
+    pred: np.ndarray,
+    ref: ReferenceGrid,
+    tid: str,
+    tile_dir: Path,
+    tif_name: str,
+    gj_name: str,
+    min_area_ha: float,
+    default_time_step: Optional[int],
+) -> list[dict]:
+    tif_path = tile_dir / tif_name
+    gj_path = tile_dir / gj_name
+    _write_binary_geotiff(pred, ref, tif_path)
+    fc = raster_to_geojson(tif_path, output_path=gj_path, min_area_ha=min_area_ha)
+    feats: list[dict] = []
+    for feat in fc.get("features", []):
+        feat.setdefault("properties", {})
+        feat["properties"]["tile_id"] = tid
+        feat["properties"].setdefault("time_step", default_time_step)
+        feats.append(feat)
+    return feats
 
 
 def build_submission(
@@ -164,15 +240,21 @@ def build_submission(
     device: Optional[torch.device] = None,
     threshold: float = 0.5,
     min_area_ha: float = 0.5,
+    use_forest_gate: bool = True,
     tile_ids: Optional[Iterable[str]] = None,
     feature_keys: tuple[str, ...] = TEMPORAL_FEATURE_KEYS,
     cache_dir: Optional[Path | str] = None,
     probs_dir: Optional[Path | str] = None,
+    default_time_step: Optional[int] = None,
+    forest_gate_threshold: float = DEFAULT_FOREST_GATE_THRESHOLD,
 ) -> Path:
     """Run inference on every tile in `split` and write one merged submission.geojson.
 
     Intermediate per-tile GeoTIFFs and GeoJSONs are written under `out_dir/tiles/`
     so you can inspect them; the final merged file is `out_dir/submission.geojson`.
+
+    `default_time_step` (e.g. 2304) is assigned to every polygon's properties so
+    the Year-accuracy metric is non-zero without ground truth.
     """
     out_dir = Path(out_dir)
     tile_dir = out_dir / "tiles"
@@ -200,24 +282,24 @@ def build_submission(
 
     for tid, ti in sorted(inventory.items()):
         try:
-            pred, ref = predict_tile(
-                model, ti, device=device, threshold=threshold,
+            prob, forest_mask, ref = predict_tile_prob(
+                model, ti, device=device,
                 feature_keys=feature_keys,
                 cache_dir=cache_dir, probs_dir=probs_dir,
+                forest_gate_threshold=forest_gate_threshold,
             )
+            pred = _threshold_and_gate(prob, forest_mask, threshold, use_forest_gate)
             if pred.sum() == 0:
                 print(f"  {tid}: no positive pixels — skipping")
                 continue
-            tif_path = tile_dir / f"{tid}.tif"
-            gj_path  = tile_dir / f"{tid}.geojson"
-            _write_binary_geotiff(pred, ref, tif_path)
-            fc = raster_to_geojson(tif_path, output_path=gj_path, min_area_ha=min_area_ha)
-            for feat in fc.get("features", []):
-                feat.setdefault("properties", {})
-                feat["properties"]["tile_id"] = tid
-                feat["properties"].setdefault("time_step", None)
-            all_features.extend(fc.get("features", []))
-            print(f"  {tid}: {len(fc.get('features', []))} polygons")
+            feats = _polygonize_and_collect(
+                pred, ref, tid, tile_dir,
+                tif_name=f"{tid}.tif", gj_name=f"{tid}.geojson",
+                min_area_ha=min_area_ha,
+                default_time_step=default_time_step,
+            )
+            all_features.extend(feats)
+            print(f"  {tid}: {len(feats)} polygons")
         except Exception as e:
             skipped.append((tid, str(e)))
             print(f"  {tid}: SKIP — {e}")
@@ -229,3 +311,90 @@ def build_submission(
 
     print(f"\nWrote {out_path} — {len(all_features)} polygons, {len(skipped)} tiles skipped.")
     return out_path
+
+
+def sweep_submission(
+    model: nn.Module,
+    data_root: Path | str,
+    out_root: Path | str,
+    thresholds: Iterable[float] = (0.5, 0.6, 0.7, 0.8, 0.85),
+    min_areas_ha: Iterable[float] = (0.5, 2.0, 5.0, 10.0),
+    split: str = "test",
+    device: Optional[torch.device] = None,
+    use_forest_gate: bool = True,
+    tile_ids: Optional[Iterable[str]] = None,
+    feature_keys: tuple[str, ...] = TEMPORAL_FEATURE_KEYS,
+    cache_dir: Optional[Path | str] = None,
+    probs_dir: Optional[Path | str] = None,
+    default_time_step: Optional[int] = 2304,
+) -> dict[tuple[float, float], Path]:
+    """Run model inference once per tile, then emit one submission per (threshold, min_area_ha).
+
+    Output: `out_root/t{t}_m{m}/submission.geojson` per combo.
+    Returns a {(threshold, min_area): path} map for downstream comparison.
+    """
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(cache_dir) if cache_dir is not None else None
+    probs_dir = Path(probs_dir) if probs_dir is not None else None
+
+    if _needs_prob_sidecar(feature_keys) and probs_dir is None:
+        raise RuntimeError(
+            "feature_keys request forest_prob_* channels but probs_dir=None."
+        )
+
+    if device is None:
+        device = next(model.parameters()).device
+
+    inventory = build_inventory(Path(data_root), split=split)
+    if tile_ids is not None:
+        inventory = {tid: ti for tid, ti in inventory.items() if tid in set(tile_ids)}
+
+    thresholds = list(thresholds)
+    min_areas_ha = list(min_areas_ha)
+
+    # prob_cache[tid] = (prob, forest_mask, ref); None means inference failed
+    prob_cache: dict[str, Optional[tuple[np.ndarray, Optional[np.ndarray], ReferenceGrid]]] = {}
+    for tid, ti in sorted(inventory.items()):
+        try:
+            prob_cache[tid] = predict_tile_prob(
+                model, ti, device=device,
+                feature_keys=feature_keys,
+                cache_dir=cache_dir, probs_dir=probs_dir,
+            )
+            print(f"  inference {tid}: prob shape {prob_cache[tid][0].shape}")
+        except Exception as e:
+            prob_cache[tid] = None
+            print(f"  inference {tid}: SKIP — {e}")
+
+    results: dict[tuple[float, float], Path] = {}
+    for thr in thresholds:
+        for mah in min_areas_ha:
+            combo_dir = out_root / f"t{thr:.2f}_m{mah:g}"
+            tile_dir = combo_dir / "tiles"
+            tile_dir.mkdir(parents=True, exist_ok=True)
+
+            all_features: list[dict] = []
+            for tid, cached in prob_cache.items():
+                if cached is None:
+                    continue
+                prob, forest_mask, ref = cached
+                pred = _threshold_and_gate(prob, forest_mask, thr, use_forest_gate)
+                if pred.sum() == 0:
+                    continue
+                feats = _polygonize_and_collect(
+                    pred, ref, tid, tile_dir,
+                    tif_name=f"{tid}.tif", gj_name=f"{tid}.geojson",
+                    min_area_ha=mah,
+                    default_time_step=default_time_step,
+                )
+                all_features.extend(feats)
+
+            merged = {"type": "FeatureCollection", "features": all_features}
+            out_path = combo_dir / "submission.geojson"
+            with open(out_path, "w") as f:
+                json.dump(merged, f)
+            print(f"[t={thr:.2f} m={mah:g}] {len(all_features)} polygons → {out_path}")
+            results[(thr, mah)] = out_path
+
+    return results

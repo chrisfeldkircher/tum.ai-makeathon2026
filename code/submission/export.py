@@ -40,7 +40,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from problem.submission_utils import raster_to_geojson  # noqa: E402
 
-NON_FOREST_THRESHOLD = 0.30  # matches LearnedForestMasker.tier_non_forest_max
+DEFAULT_FOREST_GATE_THRESHOLD = 0.30  # matches LearnedForestMasker.tier_non_forest_max
 
 
 def _resolve_crs_transform(
@@ -75,6 +75,7 @@ def export_tile(
     cache_dir: Path,
     data_dir: Optional[Path],
     probs_dir: Optional[Path],
+    forest_gate_threshold: float,
     min_area_ha: float,
     time_step: Optional[int],
 ) -> list[dict] | None:
@@ -91,7 +92,7 @@ def export_tile(
         if sidecar.exists():
             with np.load(sidecar, allow_pickle=False) as z:
                 prob_pre = z["forest_prob_pre"]
-            non_forest = prob_pre < NON_FOREST_THRESHOLD
+            non_forest = prob_pre < forest_gate_threshold
             pred = pred.copy()
             pred[non_forest] = 0
         else:
@@ -132,6 +133,8 @@ def main() -> None:
     ap.add_argument("--probs_dir",  type=Path, default=REPO_ROOT / "cache_probs",
                     help="Probability sidecar dir for forest gate (omit to skip gate)")
     ap.add_argument("--out",        type=Path, default=REPO_ROOT / "submission" / "submission.geojson")
+    ap.add_argument("--forest_gate_threshold", type=float, default=DEFAULT_FOREST_GATE_THRESHOLD,
+                    help="Mask out pixels with forest_prob_pre below this threshold before polygonization")
     ap.add_argument("--min_area_ha", type=float, default=0.5)
     ap.add_argument("--no_gate",    action="store_true",
                     help="Disable the forest-probability gate even if sidecars exist")
@@ -143,7 +146,8 @@ def main() -> None:
     if not pred_files:
         print(f"No .npz files in {args.preds_dir}"); sys.exit(1)
 
-    print(f"[export] {len(pred_files)} tiles -> {args.out}")
+    gate_desc = "disabled" if probs_dir is None else f"{args.forest_gate_threshold:.2f}"
+    print(f"[export] {len(pred_files)} tiles -> {args.out} (forest_gate={gate_desc}, min_area_ha={args.min_area_ha:g})")
     all_features: list[dict] = []
 
     for pf in pred_files:
@@ -152,8 +156,16 @@ def main() -> None:
             pred      = z["pred"]
             time_step = int(z["time_step"]) if "time_step" in z.files else None
 
-        feats = export_tile(tile_id, pred, args.cache_dir, args.data_dir,
-                            probs_dir, args.min_area_ha, time_step)
+        feats = export_tile(
+            tile_id,
+            pred,
+            args.cache_dir,
+            args.data_dir,
+            probs_dir,
+            args.forest_gate_threshold,
+            args.min_area_ha,
+            time_step,
+        )
         if feats:
             all_features.extend(feats)
 
