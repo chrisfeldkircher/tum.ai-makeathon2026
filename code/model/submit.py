@@ -33,14 +33,21 @@ from submission_utils import raster_to_geojson  # noqa: E402
 
 from data.data import (
     DEFAULT_FEATURE_KEYS,
+    PROB_FEATURE_KEYS,
     ReferenceGrid,
     TEMPORAL_FEATURE_KEYS,
     TileInventory,
     build_inventory,
+    cache_tile,
+    load_probability_sidecar,
     preprocess_tile,
     stack_features,
 )
 from model.dann_temporal_unet import inference_pipeline
+
+
+def _needs_prob_sidecar(feature_keys: Iterable[str]) -> bool:
+    return any(k in PROB_FEATURE_KEYS for k in feature_keys)
 
 
 class _GRLCompatAdapter(nn.Module):
@@ -78,6 +85,38 @@ def _write_binary_geotiff(pred: np.ndarray, ref: ReferenceGrid, out_path: Path) 
         dst.write(pred.astype(np.uint8), 1)
 
 
+def _load_tile_tensors(
+    ti: TileInventory,
+    feature_keys: tuple[str, ...],
+    cache_dir: Optional[Path],
+    probs_dir: Optional[Path],
+) -> dict[str, np.ndarray]:
+    """Mirror the training dataset's load path: cached .npz + optional prob sidecar.
+
+    Falls back to a live `preprocess_tile` when `cache_dir` is None. Raises if
+    PROB feature keys are requested but no sidecar is available — silently
+    zero-filling those channels would produce garbage predictions because the
+    baseline learned to rely on them.
+    """
+    if cache_dir is not None:
+        cache_path = cache_tile(ti, cache_dir)
+        with np.load(cache_path, allow_pickle=False) as npz:
+            tensors = {k: npz[k] for k in npz.files}
+    else:
+        tensors = preprocess_tile(ti)
+
+    if _needs_prob_sidecar(feature_keys):
+        if probs_dir is None:
+            raise RuntimeError(
+                f"feature_keys include PROB channels {PROB_FEATURE_KEYS} but probs_dir is None. "
+                "Pass probs_dir=... and pre-generate sidecars via "
+                "`python code/reports/p2_post_period.py --cache_dir <cache> --out_dir <probs>`."
+            )
+        tensors.update(load_probability_sidecar(ti.tile_id, probs_dir))
+
+    return tensors
+
+
 def predict_tile(
     model: nn.Module,
     ti: TileInventory,
@@ -87,9 +126,11 @@ def predict_tile(
     threshold: float = 0.5,
     use_forest_gate: bool = True,
     feature_keys: tuple[str, ...] = TEMPORAL_FEATURE_KEYS,
+    cache_dir: Optional[Path] = None,
+    probs_dir: Optional[Path] = None,
 ) -> tuple[np.ndarray, ReferenceGrid]:
     """Run inference on one tile, returning (binary_pred_HW, reference_grid)."""
-    tensors = preprocess_tile(ti)
+    tensors = _load_tile_tensors(ti, feature_keys, cache_dir, probs_dir)
     stack = stack_features(tensors, feature_keys=feature_keys)
     tile_tensor = torch.from_numpy(stack).float()
 
@@ -125,6 +166,8 @@ def build_submission(
     min_area_ha: float = 0.5,
     tile_ids: Optional[Iterable[str]] = None,
     feature_keys: tuple[str, ...] = TEMPORAL_FEATURE_KEYS,
+    cache_dir: Optional[Path | str] = None,
+    probs_dir: Optional[Path | str] = None,
 ) -> Path:
     """Run inference on every tile in `split` and write one merged submission.geojson.
 
@@ -134,6 +177,16 @@ def build_submission(
     out_dir = Path(out_dir)
     tile_dir = out_dir / "tiles"
     tile_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_dir = Path(cache_dir) if cache_dir is not None else None
+    probs_dir = Path(probs_dir) if probs_dir is not None else None
+
+    if _needs_prob_sidecar(feature_keys) and probs_dir is None:
+        raise RuntimeError(
+            "feature_keys request forest_prob_* channels but probs_dir=None. "
+            "Pass probs_dir=Path('../cache_probs') and run the sidecar step first:\n"
+            "  python code/reports/p2_post_period.py --cache_dir ../cache --out_dir ../cache_probs"
+        )
 
     if device is None:
         device = next(model.parameters()).device
@@ -150,6 +203,7 @@ def build_submission(
             pred, ref = predict_tile(
                 model, ti, device=device, threshold=threshold,
                 feature_keys=feature_keys,
+                cache_dir=cache_dir, probs_dir=probs_dir,
             )
             if pred.sum() == 0:
                 print(f"  {tid}: no positive pixels — skipping")
